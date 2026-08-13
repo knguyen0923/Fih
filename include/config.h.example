@@ -1,0 +1,64 @@
+#pragma once
+
+// ============================================================================
+// config.h.example — secrets and tunables template
+// ============================================================================
+//
+// Copy this file to config.h (in this same folder) and fill in real values:
+//
+//   cp include/config.h.example include/config.h
+//
+// config.h is listed in .gitignore, so your WiFi password and API key never
+// get committed to version control, even if you `git add .` carelessly later.
+// Every other source file includes "config.h" (not this .example file).
+
+// --- WiFi credentials ---
+// Only 2.4GHz WiFi networks work — the ESP32's radio doesn't support 5GHz.
+#define WIFI_SSID     "your-wifi-ssid"
+#define WIFI_PASSWORD "your-wifi-password"
+
+// --- Gemini API key ---
+// Get one free at https://aistudio.google.com/apikey
+// This key lives on the device itself (baked into the compiled firmware).
+// That's an acceptable tradeoff for a personal project that stays on your own
+// hardware — just don't publish your compiled firmware or source tree with a
+// real key filled in here.
+#define GEMINI_API_KEY "your-gemini-api-key"
+
+// --- Model selection ---
+// Model names are kept as #defines (config), not hardcoded in gemini.cpp,
+// because Google's model lineup changes over time. These were confirmed
+// available as of Aug 2026 — check Google's current model list
+// (https://ai.google.dev/gemini-api/docs/models) before relying on them long
+// term, especially if either call starts failing with a "model not found"
+// error.
+#define GEMINI_TEXT_MODEL "gemini-2.5-flash-lite"        // used by understandSpeech() and textOnlyQuery()
+#define GEMINI_TTS_MODEL  "gemini-2.5-flash-preview-tts" // used by synthesizeSpeech()
+#define GEMINI_TTS_VOICE  "Kore"                          // one of Gemini's prebuilt TTS voices
+
+// Upper bound on how many tokens Gemini's reply may contain. This exists for a
+// very physical reason: a longer text reply means a longer TTS audio reply,
+// which means a bigger PCM buffer has to fit in PSRAM downstream. Keeping
+// replies short keeps memory use (and the user's wait time) bounded.
+#define GEMINI_MAX_OUTPUT_TOKENS 150
+
+// ============================================================================
+// Hardware bring-up test modes
+// ============================================================================
+// These two flags let you validate the hardware and network in isolated
+// stages before trusting the full record -> Gemini -> speak pipeline. Leave
+// both at 0 for normal day-to-day operation. See the README's "Build phases"
+// section for the full walkthrough of how to use each one.
+
+// When 1: button press/release records audio and immediately plays it straight
+// back out the speaker — no WiFi, no Gemini calls at all. Use this first, with
+// no WiFi network even required, to confirm the mic and amp are wired
+// correctly and sound reasonable before adding any cloud dependency.
+#define LOOPBACK_TEST_MODE 0
+
+// When 1: on every boot, the device connects to WiFi and immediately fires one
+// hardcoded text-only Gemini request, printing the reply over Serial — the
+// audio pipeline (mic/button/speaker) isn't touched at all. Use this second,
+// after loopback works, to confirm WiFi + TLS + your API key are all correct
+// before testing the audio-in/audio-out round trip.
+#define WIFI_TEXT_TEST_MODE 0
