@@ -23,6 +23,7 @@ simple enough to build and debug as a solo hobby project.
 - [Project layout](#project-layout)
 - [Setup](#setup)
 - [Build / upload / monitor](#build--upload--monitor)
+- [Unit tests](#unit-tests)
 - [Build phases (hardware bring-up)](#build-phases-hardware-bring-up)
 - [How the Gemini calls work](#how-the-gemini-calls-work)
 - [Memory budget](#memory-budget)
@@ -125,17 +126,26 @@ post-boot) and the internal PSRAM/flash pins (6–11).
 
 ```
 Fih/
-├── platformio.ini           PlatformIO build config (board, framework, dependencies)
-├── .gitignore                Keeps include/config.h (secrets) out of version control
+├── platformio.ini             PlatformIO build config: the real firmware (wrover) +
+│                                a host-machine unit test environment (native)
+├── .gitignore                  Keeps include/config.h (secrets) out of version control
 ├── include/
-│   ├── pins.h                 GPIO map + audio-format constants
-│   └── config.h.example       Template for WiFi/API-key secrets — copy to config.h
-└── src/
-    ├── main.cpp                State machine: button, recording, LED, orchestration
-    ├── audio.h / audio.cpp      I2S mic capture + amp playback, WAV header builder
-    ├── gemini.h / gemini.cpp    Both HTTPS calls to Gemini, JSON building/parsing, retry
-    └── base64.h / base64.cpp    Self-contained base64 codec (no external dependency)
+│   ├── pins.h                   GPIO map + audio-format constants
+│   └── config.h.example         Template for WiFi/API-key secrets — copy to config.h
+├── src/
+│   ├── main.cpp                  State machine: button, recording, LED, orchestration
+│   ├── audio.h / audio.cpp        I2S mic capture + amp playback (hardware-dependent)
+│   ├── gemini.h / gemini.cpp      Both HTTPS calls to Gemini, JSON, retry (hardware-dependent)
+│   ├── base64.h / base64.cpp      Arduino String-facing base64 wrapper (hardware-dependent)
+│   ├── base64_core.h / .cpp       The actual base64 algorithm — pure, unit-tested
+│   └── wav.h / wav.cpp            WAV header construction — pure, unit-tested
+└── test/
+    └── test_native/test_main.cpp  Unity tests for base64_core + wav (see below)
 ```
+
+`base64_core`/`wav` are split out from `base64`/`audio` specifically because they
+have zero Arduino/ESP-IDF dependency — that's what makes it possible to unit-test
+them on a plain desktop machine, with no ESP32 attached.
 
 Every file has header comments at the top explaining its role, and inline
 comments on the less-obvious logic (I2S configuration fields, the mic
@@ -175,6 +185,36 @@ This firmware has been build-verified with `pio run` (compiles cleanly against
 `framework-arduinoespressif32 @ 3.20017`) but **not** hardware-tested — no
 ESP32 was available in the environment this was built in. The steps below walk
 through validating it on real hardware in stages.
+
+## Unit tests
+
+Most of this firmware — I2S audio, WiFi, the Gemini HTTPS calls — can only be
+meaningfully tested on real hardware (that's what the build phases below are
+for). But two pieces have no hardware dependency at all and get real,
+automated unit tests that run on your own machine, no ESP32 required:
+
+- **`base64_core`** — the base64 encode/decode algorithm
+- **`wav`** — the 44-byte WAV header builder
+
+Run them with:
+
+```bash
+pio test -e native
+```
+
+This covers known base64 test vectors, a full encode/decode round trip at
+both small and realistic (~470KB) recording sizes, undersized-buffer error
+handling, and every field in the WAV header at its exact byte offset. All 13
+cases pass as of the last run.
+
+`platformio.ini`'s `[env:native]` environment only compiles `base64_core.cpp`
+and `wav.cpp` for this — `audio.cpp`, `gemini.cpp`, `base64.cpp`, and
+`main.cpp` all depend on Arduino/ESP-IDF headers that don't exist on a
+desktop target, so they're excluded from the test build (see the
+`build_src_filter` comment there). Plain `pio run` / `pio run -t upload`
+still only ever targets the real `wrover` environment — `default_envs =
+wrover` keeps the native/test environment from being accidentally built or
+flashed.
 
 ## Build phases (hardware bring-up)
 

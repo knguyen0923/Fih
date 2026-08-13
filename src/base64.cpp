@@ -1,88 +1,23 @@
 #include "base64.h"
-
-// The 64 characters used to represent 6 bits of data each. Index 0-25 are
-// uppercase letters, 26-51 lowercase, 52-61 digits, then '+' and '/'.
-static const char ENCODE_TABLE[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-// The reverse lookup: given a base64 character, what 6-bit value (0-63) does
-// it represent? Returns -1 for characters that aren't part of the alphabet
-// (padding '=', whitespace, newlines, etc.) so the caller can skip them.
-static inline int8_t decodeChar(char c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1; // padding or invalid
-}
+#include <esp_heap_caps.h>
 
 String base64Encode(const uint8_t* data, size_t len) {
-    String out;
-    // Pre-allocate the exact final size up front. For a ~470KB recording this
-    // avoids String silently doubling its buffer over and over as it grows,
-    // which would otherwise fragment the PSRAM heap.
-    out.reserve(((len + 2) / 3) * 4);
+    size_t needed = base64EncodedLen(len);
 
-    // Main loop: base64 works on 3 input bytes (24 bits) at a time, which
-    // split evenly into four 6-bit groups -> four output characters.
-    size_t i = 0;
-    while (i + 3 <= len) {
-        uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8) | data[i + 2];
-        out += ENCODE_TABLE[(n >> 18) & 0x3F]; // top 6 bits
-        out += ENCODE_TABLE[(n >> 12) & 0x3F];
-        out += ENCODE_TABLE[(n >> 6) & 0x3F];
-        out += ENCODE_TABLE[n & 0x3F];          // bottom 6 bits
-        i += 3;
-    }
+    // A large recording can produce a base64 string in the hundreds of KB.
+    // Rather than growing an Arduino String character-by-character (which
+    // risks repeated reallocation on the PSRAM heap), encode into a scratch
+    // PSRAM buffer via the pure core algorithm, then build the String from it
+    // in one shot.
+    char* scratch = (char*)heap_caps_malloc(needed > 0 ? needed : 1, MALLOC_CAP_SPIRAM);
+    if (!scratch) return String();
 
-    // Handle the 1 or 2 leftover bytes at the end, if len isn't a multiple of
-    // 3. Padding with '=' tells the decoder how many of the last 4 characters
-    // are "real" data vs filler.
-    size_t remaining = len - i;
-    if (remaining == 1) {
-        uint32_t n = (uint32_t)data[i] << 16;
-        out += ENCODE_TABLE[(n >> 18) & 0x3F];
-        out += ENCODE_TABLE[(n >> 12) & 0x3F];
-        out += "==";
-    } else if (remaining == 2) {
-        uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8);
-        out += ENCODE_TABLE[(n >> 18) & 0x3F];
-        out += ENCODE_TABLE[(n >> 12) & 0x3F];
-        out += ENCODE_TABLE[(n >> 6) & 0x3F];
-        out += "=";
-    }
-
+    size_t written = base64EncodeCore(data, len, scratch, needed);
+    String out(scratch, written);
+    heap_caps_free(scratch);
     return out;
 }
 
 size_t base64Decode(const String& in, uint8_t* out, size_t outCap) {
-    size_t inLen = in.length();
-    // Trailing '=' padding just marks "no more real data" — decodeChar()
-    // already returns -1 for it, but trimming it here keeps the loop below
-    // simpler to reason about.
-    while (inLen > 0 && in[inLen - 1] == '=') inLen--;
-
-    size_t outLen = 0;
-    uint32_t buffer = 0; // accumulates decoded 6-bit groups until we have a full byte
-    int bits = 0;        // how many valid bits are currently sitting in `buffer`
-
-    for (size_t i = 0; i < inLen; i++) {
-        int8_t val = decodeChar(in[i]);
-        if (val < 0) continue; // skip whitespace/newlines defensively
-
-        // Shift in 6 new bits from this character.
-        buffer = (buffer << 6) | (uint32_t)val;
-        bits += 6;
-
-        // Once we've accumulated a full byte (8 bits) worth, peel it off the
-        // top of the buffer and emit it.
-        if (bits >= 8) {
-            bits -= 8;
-            if (outLen >= outCap) return 0; // caller's buffer too small
-            out[outLen++] = (uint8_t)((buffer >> bits) & 0xFF);
-        }
-    }
-
-    return outLen;
+    return base64DecodeCore(in.c_str(), in.length(), out, outCap);
 }

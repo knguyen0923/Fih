@@ -7,3 +7,6 @@
 
 # Secrets — never commit real WiFi/API credentials
 include/config.h
+
+# Local-only project notes for Claude/future-you — not meant for the repo
+CLAUDE.md
