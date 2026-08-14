@@ -41,7 +41,7 @@ simple enough to build and debug as a solo hobby project.
 ┌─────────────────────────────────────────────┐
 │                  ESP32 board                 │
 │                                               │
-│  [Button] → [I2S Mic] → [PSRAM buffer]       │
+│  [Button] → [I2S Mic] → [RAM buffer]         │
 │                              │                │
 │                    (button released)          │
 │                              ▼                │
@@ -69,31 +69,37 @@ Firmware state machine (see `src/main.cpp`):
 
 ```
 IDLE
-  → (button press) → RECORDING (I2S capture into PSRAM buffer)
-  → (button release) → UPLOADING (base64 encode + HTTPS POST #1 — audio understanding)
+  → (button press) → RECORDING (I2S capture into RAM buffer)
+  → (button release) → UPLOADING (streamed base64 encode + HTTPS POST #1 — audio understanding)
   → PROCESSING (await text response)
-  → SYNTHESIZING (HTTPS POST #2 — text-to-speech)
-  → PLAYING (decode + I2S playback)
+  → SYNTHESIZING (HTTPS POST #2 — text-to-speech, decoded and played back per chunk as it streams in)
   → IDLE
 ```
 
 Because there's no persistent connection or background task, everything from
-UPLOADING through PLAYING runs as one blocking sequence right after a
+UPLOADING through SYNTHESIZING runs as one blocking sequence right after a
 recording finishes (`processInteraction()` in `main.cpp`) — the state enum
-mainly exists to drive the status LED, not to model concurrent work.
+mainly exists to drive the status LED, not to model concurrent work. There's
+no separate PLAYING step in this path any more: `synthesizeSpeech()` plays
+each decoded chunk of the reply as it arrives rather than waiting for the
+whole reply first (see [Memory budget](#memory-budget)) — `PLAYING` as a
+state still exists only for `LOOPBACK_TEST_MODE`'s direct mic-to-speaker
+playback, which is unrelated to the Gemini calls.
 
-**Why this board, not ESP32-S3 or a plain WROOM:** the design holds two large
-buffers at once (a ~470KB recording and up to ~300KB of decoded reply audio)
-plus a WiFi/TLS stack — nowhere near enough room in the base ESP32's 520KB of
-internal SRAM. A **WROVER module with PSRAM** is what makes the naive,
-non-streaming approach in this firmware fit comfortably. See
+**Why this board:** an ESP32-WROOM-32D has no PSRAM, only ~320KB of internal
+SRAM shared with the WiFi/TLS stack — nowhere near enough to hold a whole
+recording *and* a whole decoded reply in memory at once, the way an earlier
+WROVER-based design did. Streaming the base64-encoded upload and the decoded
+TTS reply (neither is ever held in full — see
+[How the Gemini calls work](#how-the-gemini-calls-work)) gets peak memory use
+down to essentially one buffer: the raw recording. See
 [Memory budget](#memory-budget) below.
 
 ## Hardware
 
 | Component | Notes |
 |---|---|
-| **ESP32 dev board — WROVER module (PSRAM)** | Hard requirement, not optional — see above. Look for "4MB PSRAM" or "8MB PSRAM" in the listing. |
+| **ESP32 dev board — WROOM-32D** | No PSRAM required — see above. `platformio.ini` targets `board = esp32dev`, a generic profile that fits this module. |
 | I2S MEMS microphone | e.g. INMP441 |
 | I2S audio amp + speaker | e.g. MAX98357A breakout + small 4Ω speaker |
 | Momentary pushbutton | Push-to-talk trigger |
@@ -120,13 +126,13 @@ rather than time-sharing one bus — this design never records and plays back
 at the same time (push-to-talk is strictly sequential), so there's no need for
 full-duplex bus-sharing logic. Pins were chosen to avoid strapping pins (0, 2,
 5, 12, 15 — GPIO2 is the one intentional exception, safe to use as an LED pin
-post-boot) and the internal PSRAM/flash pins (6–11).
+post-boot) and the module's internal SPI flash pins (6–11).
 
 ## Project layout
 
 ```
 Fih/
-├── platformio.ini             PlatformIO build config: the real firmware (wrover) +
+├── platformio.ini             PlatformIO build config: the real firmware (esp32) +
 │                                a host-machine unit test environment (native)
 ├── .gitignore                  Keeps include/config.h (secrets) out of version control
 ├── include/
@@ -135,17 +141,18 @@ Fih/
 ├── src/
 │   ├── main.cpp                  State machine: button, recording, LED, orchestration
 │   ├── audio.h / audio.cpp        I2S mic capture + amp playback (hardware-dependent)
-│   ├── gemini.h / gemini.cpp      Both HTTPS calls to Gemini, JSON, retry (hardware-dependent)
-│   ├── base64.h / base64.cpp      Arduino String-facing base64 wrapper (hardware-dependent)
-│   ├── base64_core.h / .cpp       The actual base64 algorithm — pure, unit-tested
+│   ├── gemini.h / gemini.cpp      Both HTTPS calls to Gemini — streaming upload body
+│   │                               (Base64AudioBodyStream) and streaming TTS response
+│   │                               decode, JSON, retry (hardware-dependent)
+│   ├── base64_core.h / .cpp       The base64 algorithm, incl. a streaming decoder —
+│   │                               pure, unit-tested
 │   └── wav.h / wav.cpp            WAV header construction — pure, unit-tested
 └── test/
     └── test_native/test_main.cpp  Unity tests for base64_core + wav (see below)
 ```
 
-`base64_core`/`wav` are split out from `base64`/`audio` specifically because they
-have zero Arduino/ESP-IDF dependency — that's what makes it possible to unit-test
-them on a plain desktop machine, with no ESP32 attached.
+`base64_core`/`wav` have zero Arduino/ESP-IDF dependency — that's what makes it
+possible to unit-test them on a plain desktop machine, with no ESP32 attached.
 
 Every file has header comments at the top explaining its role, and inline
 comments on the less-obvious logic (I2S configuration fields, the mic
@@ -176,15 +183,14 @@ pio run -t upload    # build + flash
 pio device monitor    # serial monitor (115200 baud)
 ```
 
-`platformio.ini` targets `board = upesy_wrover`, a generic WROVER dev board
-profile. If your specific board doesn't behave well under that id (e.g. wrong
-default flash size), switch to `board = esp32dev` — PSRAM support comes from
-the `build_flags` (`-DBOARD_HAS_PSRAM`), not the board id, so either works.
+`platformio.ini` targets `board = esp32dev`, a generic WROOM-32D dev board
+profile.
 
 This firmware has been build-verified with `pio run` (compiles cleanly against
-`framework-arduinoespressif32 @ 3.20017`) but **not** hardware-tested — no
-ESP32 was available in the environment this was built in. The steps below walk
-through validating it on real hardware in stages.
+`framework-arduinoespressif32 @ 3.20017`, RAM/flash usage reported at the end
+of the build) but **not** hardware-tested — no ESP32 was available in the
+environment this was built in. The steps below walk through validating it on
+real hardware in stages.
 
 ## Unit tests
 
@@ -202,19 +208,21 @@ Run them with:
 pio test -e native
 ```
 
-This covers known base64 test vectors, a full encode/decode round trip at
-both small and realistic (~470KB) recording sizes, undersized-buffer error
-handling, and every field in the WAV header at its exact byte offset. All 13
-cases pass as of the last run.
+This covers known base64 test vectors, a full encode/decode round trip at both
+small and realistic (~470KB) recording sizes, undersized-buffer error
+handling, the streaming decoder against arbitrary chunk splits (1 byte at a
+time, uneven 7-byte chunks, and a ~470KB buffer split into TLS-read-sized
+~512-byte pieces — the same shapes `synthesizeSpeech()` actually feeds it in
+`gemini.cpp`), and every field in the WAV header at its exact byte offset.
+All 16 cases pass as of the last run.
 
 `platformio.ini`'s `[env:native]` environment only compiles `base64_core.cpp`
-and `wav.cpp` for this — `audio.cpp`, `gemini.cpp`, `base64.cpp`, and
-`main.cpp` all depend on Arduino/ESP-IDF headers that don't exist on a
-desktop target, so they're excluded from the test build (see the
-`build_src_filter` comment there). Plain `pio run` / `pio run -t upload`
-still only ever targets the real `wrover` environment — `default_envs =
-wrover` keeps the native/test environment from being accidentally built or
-flashed.
+and `wav.cpp` for this — `audio.cpp`, `gemini.cpp`, and `main.cpp` all depend
+on Arduino/ESP-IDF headers that don't exist on a desktop target, so they're
+excluded from the test build (see the `build_src_filter` comment there).
+Plain `pio run` / `pio run -t upload` still only ever targets the real
+`esp32` environment — `default_envs = esp32` keeps the native/test
+environment from being accidentally built or flashed.
 
 ## Build phases (hardware bring-up)
 
@@ -222,7 +230,7 @@ Two compile-time toggles in `config.h` let you validate the hardware in
 stages rather than debugging the whole pipeline at once:
 
 1. **Audio loopback, no network.** Set `LOOPBACK_TEST_MODE 1`. Button
-   press/release records to PSRAM and immediately plays it straight back
+   press/release records to RAM and immediately plays it straight back
    through the speaker — no WiFi, no Gemini calls at all. Confirms mic, amp,
    and wiring before adding any cloud dependency.
 2. **WiFi + basic HTTPS.** Set `LOOPBACK_TEST_MODE` back to `0` and
@@ -251,10 +259,14 @@ other Google API documentation defaults to snake_case.
 - Model: `GEMINI_TEXT_MODEL` in `config.h` (a Flash/Flash-Lite model — Pro's
   free-tier daily cap is too restrictive for regular use)
 - Request: one `text` part (a fixed instruction prompt) + one `inlineData`
-  part containing the base64-encoded WAV recording, `mimeType: "audio/wav"`
+  part containing the base64-encoded WAV recording, `mimeType: "audio/wav"` —
+  the base64 text is generated and streamed straight to the socket a chunk at
+  a time (`Base64AudioBodyStream` in `gemini.cpp`), so the ~1.3x-larger
+  encoded copy of the recording never exists in memory whole
 - `generationConfig.maxOutputTokens` bounds the reply length, which in turn
-  bounds the TTS audio length and downstream memory use
-- Response: plain text at `candidates[0].content.parts[0].text`
+  bounds the TTS audio length
+- Response: plain text at `candidates[0].content.parts[0].text` (small,
+  bounded by `maxOutputTokens`, so read and parsed in one shot as before)
 
 **Call 2 — `synthesizeSpeech()` (text → speech):**
 - Model: `GEMINI_TTS_MODEL` in `config.h`
@@ -263,8 +275,11 @@ other Google API documentation defaults to snake_case.
 - Response: base64-encoded **raw PCM** audio at
   `candidates[0].content.parts[0].inlineData.data`, tagged with a mime type
   like `audio/L16;codec=pcm;rate=24000` — this is *not* a WAV file, just
-  headerless 16-bit/24kHz/mono samples, decoded and fed straight to the I2S
-  amp.
+  headerless 16-bit/24kHz/mono samples. The response body is read
+  incrementally (not buffered whole) and each decoded chunk is handed to a
+  callback that plays it immediately, so a full reply's worth of decoded PCM
+  never needs to fit in memory at once either — see `streamTtsResponse()` in
+  `gemini.cpp`.
 
 Both calls retry once (after a fixed delay) on an HTTP 429 (rate limited)
 response, and return `false` on any other failure so `main.cpp` can flash an
@@ -272,21 +287,29 @@ error indicator and return to idle rather than crash or hang.
 
 ## Memory budget
 
-Rough numbers for a 15-second max recording on a WROVER board (4MB or 8MB
-PSRAM):
+This board (ESP32-WROOM-32D) has no PSRAM — only ~320KB of internal SRAM,
+shared with the Arduino core, WiFi, and TLS. An earlier revision of this
+firmware targeted a WROVER module and held three large buffers in PSRAM at
+once (a ~470KB recording, a ~625KB base64 upload copy, and a 300KB decoded
+TTS buffer); none of that fits here. Instead, the upload and the TTS reply
+are both streamed (see [How the Gemini calls work](#how-the-gemini-calls-work))
+so only one large buffer remains:
 
 | Item | Size | Notes |
 |---|---|---|
-| Raw mic buffer (15s @ 16kHz/16-bit/mono) | ~470 KB | `wavBuf`/`pcmBuf` in `main.cpp`, held in PSRAM during recording |
-| Base64-encoded upload body | ~625 KB | Built and freed inside `understandSpeech()` — 33% base64 inflation over the raw buffer |
-| TLS session overhead | ~50–100 KB | mbedTLS record buffers + session state |
-| Base64-encoded TTS response | ~100–300 KB | Bounded by `GEMINI_MAX_OUTPUT_TOKENS` — keep replies short |
-| Decoded playback PCM buffer | 300 KB (allocated) | `ttsBuf` in `main.cpp`, same scale as the encoded response, un-inflated |
-| **Rough peak total** | **~1.3–1.7 MB** | Fits comfortably on a 4MB WROVER board; more headroom on 8MB |
+| Raw mic buffer (`MAX_RECORDING_SECONDS` @ 16kHz/16-bit/mono) | ~160 KB at the default 5s cap | `wavBuf`/`pcmBuf` in `main.cpp` — the only large buffer left, plain internal heap (`malloc()`), held for the device's whole uptime |
+| Base64-encoded upload body | none held at once | Streamed a ~1KB-encoded-chunk at a time straight to the TLS socket (`Base64AudioBodyStream` in `gemini.cpp`) |
+| TLS session overhead (transient, per call) | ~40–50 KB | mbedTLS record buffers + session state, active only for the duration of each `understandSpeech()`/`synthesizeSpeech()` call |
+| Decoded TTS reply audio | none held at once | Decoded and played a chunk at a time as the response streams in (`streamTtsResponse()` in `gemini.cpp`) |
 
-`main.cpp` logs `ESP.getFreePsram()` at boot and after buffer allocation —
-compare against these numbers on your actual board rather than trusting the
-estimate blindly.
+`MAX_RECORDING_SECONDS` (in `pins.h`) is deliberately conservative — 5 seconds
+by default — because `wavBuf` is allocated once at boot and held permanently,
+while TLS still needs its own ~40-50KB on top of that during every request.
+`main.cpp` logs `ESP.getFreeHeap()` at boot and after buffer allocation;
+compare those numbers against actual behavior on your board (does a long
+recording followed immediately by a Gemini call still succeed?) before
+raising `MAX_RECORDING_SECONDS` — this can only be tuned on real hardware,
+not estimated from a datasheet.
 
 ## Things to spot-check once you have hardware
 
@@ -308,6 +331,16 @@ because they can drift as Google's API evolves:
 - **Mic gain** (`MIC_GAIN_SHIFT` in `audio.cpp`) — a starting-point bit-shift
   for converting the mic's 32-bit I2S frames to 16-bit PCM. If Phase 1
   loopback sounds too quiet, decrease it; if it clips, increase it.
+- **`MAX_RECORDING_SECONDS`** (`pins.h`) — 5 seconds is a conservative
+  starting point given this board's lack of PSRAM, not a measured value (no
+  ESP32 was available to measure actual free heap in the environment this was
+  built in). Watch the `ESP.getFreeHeap()` logs in `main.cpp` and adjust — see
+  [Memory budget](#memory-budget).
+- **Streaming upload/playback themselves** — `Base64AudioBodyStream` and
+  `streamTtsResponse()` in `gemini.cpp` are new, hardware-untested code
+  (build-verified only). Watch for truncated/garbled replies or upload
+  failures on your first few real interactions, which would point to a bug in
+  the streaming logic rather than a network fluke.
 
 ## Security / privacy notes
 
@@ -316,7 +349,9 @@ because they can drift as Google's API evolves:
   or compiled firmware with a real key baked in.
 - TLS uses `WiFiClientSecure::setInsecure()` (no certificate validation) for
   simplicity. Fine for a personal project; swap in a pinned Google root CA in
-  `gemini.cpp`'s `postJson()` if you want stricter validation.
+  `gemini.cpp` (each of `postJson()`, `postStreamed()`, and
+  `synthesizeSpeech()` opens its own `WiFiClientSecure`) if you want stricter
+  validation.
 - Google's free tier allows using submitted prompts for model training/review
   (unlike the paid tier) — worth being a deliberate choice since this device
   records your voice.
@@ -325,24 +360,29 @@ because they can drift as Google's API evolves:
 
 | Symptom | Likely cause |
 |---|---|
-| Build fails with a PSRAM/heap error | Board doesn't actually have PSRAM, or `-DBOARD_HAS_PSRAM` build flag got removed from `platformio.ini` |
+| Device halts at boot printing "Failed to allocate recording buffer" | `wavBuf` didn't fit in free heap — lower `MAX_RECORDING_SECONDS` in `pins.h` |
 | Loopback recording is silent or very quiet | Check mic wiring against the pin table; try lowering `MIC_GAIN_SHIFT` in `audio.cpp` |
 | Loopback recording clips/distorts | Raise `MIC_GAIN_SHIFT` in `audio.cpp` |
 | `WIFI_TEXT_TEST_MODE` never connects | Wrong SSID/password in `config.h`, or a 5GHz-only network (unsupported) |
 | Gemini calls fail with HTTP 4xx | Check `GEMINI_API_KEY` and that `GEMINI_TEXT_MODEL`/`GEMINI_TTS_MODEL` are still valid model names |
 | Gemini calls fail with HTTP 429 repeatedly | Free-tier rate limit — widen `RETRY_DELAY_MS` in `gemini.cpp` or reduce request frequency |
 | TTS playback sounds wrong (pitch/speed) | Confirm the logged `mimeType` from `synthesizeSpeech()` really is 24kHz — `SAMPLE_RATE_PLAYBACK` in `pins.h` must match |
-| Device resets/crashes mid-recording | Likely a PSRAM allocation issue — check the free-PSRAM logs at boot against the [memory budget](#memory-budget) |
+| TTS playback cuts off partway through | `streamTtsResponse()` in `gemini.cpp` couldn't find the closing quote on the `data` field before the connection closed — check WiFi stability, or that `GEMINI_MAX_OUTPUT_TOKENS` hasn't been raised to where the reply is unexpectedly long |
+| Understanding/TTS calls fail right after a long recording | TLS's own ~40-50KB transient allocation didn't fit alongside `wavBuf` — lower `MAX_RECORDING_SECONDS` in `pins.h` (see [Memory budget](#memory-budget)) |
+| Device resets/crashes mid-recording | Check the free-heap logs at boot against the [memory budget](#memory-budget) |
 
 ## Testing checklist
 
 - [ ] Mic captures clean audio (check for clipping/noise via Phase 1 loopback)
 - [ ] Speaker playback is clear at usable volume
 - [ ] WiFi reconnects gracefully after a drop (handled in `loop()`)
-- [ ] TLS handshake succeeds reliably under PSRAM + audio buffer memory pressure
+- [ ] TLS handshake succeeds reliably under `wavBuf` + WiFi/TLS memory pressure
 - [ ] Button debounce doesn't cause false triggers or missed releases
 - [ ] Max recording length cutoff works if button is held too long
 - [ ] Behavior on API error/rate limit is graceful (rapid LED blink, no crash)
+- [ ] Streamed upload/playback don't glitch under real network jitter
+      (`Base64AudioBodyStream`/`streamTtsResponse()` in `gemini.cpp` are
+      hardware-untested — build-verified only)
 
 ## Future upgrades (not in v1 scope)
 

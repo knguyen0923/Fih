@@ -114,6 +114,76 @@ void test_base64_decode_output_buffer_too_small(void) {
     TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)n);
 }
 
+// Feeds `encoded` (encLen chars) through base64DecodeStreamUpdate() split
+// into fixed-size pieces of `chunkSize`, concatenating the decoded output as
+// it goes. Used below to check the streaming decoder gives the exact same
+// result as the one-shot base64DecodeCore() regardless of where a chunk
+// boundary happens to fall -- including mid-character-group splits, which
+// is exactly the situation synthesizeSpeech() faces reading TTS audio off a
+// TLS socket in gemini.cpp.
+static size_t decodeInChunks(const char* encoded, size_t encLen, size_t chunkSize, uint8_t* out, size_t outCap) {
+    Base64DecodeStream state;
+    base64DecodeStreamInit(&state);
+
+    size_t outLen = 0;
+    for (size_t pos = 0; pos < encLen; pos += chunkSize) {
+        size_t n = (pos + chunkSize <= encLen) ? chunkSize : (encLen - pos);
+        size_t written = base64DecodeStreamUpdate(&state, encoded + pos, n, out + outLen, outCap - outLen);
+        outLen += written;
+    }
+    return outLen;
+}
+
+// A chunk size of 1 forces every single base64 character through its own
+// update() call, which is the strongest test of the cross-call bit-carry
+// logic: no two characters are ever decoded in the same call.
+void test_base64_decode_stream_one_byte_at_a_time(void) {
+    uint8_t original[64];
+    for (int i = 0; i < 64; i++) original[i] = (uint8_t)(i * 7 + 3);
+
+    char encoded[128];
+    size_t encLen = base64EncodeCore(original, sizeof(original), encoded, sizeof(encoded));
+
+    uint8_t decoded[64];
+    size_t decLen = decodeInChunks(encoded, encLen, 1, decoded, sizeof(decoded));
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)sizeof(original), (uint32_t)decLen);
+    TEST_ASSERT_EQUAL_MEMORY(original, decoded, sizeof(original));
+}
+
+// A chunk size of 7 doesn't evenly divide into base64's 4-character groups,
+// so most chunk boundaries land mid-group -- a more realistic approximation
+// of arbitrary TLS read boundaries than either 1-byte or 4-byte-aligned
+// splits would be.
+void test_base64_decode_stream_uneven_chunks(void) {
+    uint8_t original[256];
+    for (int i = 0; i < 256; i++) original[i] = (uint8_t)i;
+
+    char encoded[512];
+    size_t encLen = base64EncodeCore(original, sizeof(original), encoded, sizeof(encoded));
+
+    uint8_t decoded[256];
+    size_t decLen = decodeInChunks(encoded, encLen, 7, decoded, sizeof(decoded));
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)sizeof(original), (uint32_t)decLen);
+    TEST_ASSERT_EQUAL_MEMORY(original, decoded, sizeof(original));
+}
+
+// Same realistic-scale (~470KB) buffer as test_base64_roundtrip_large_buffer,
+// but decoded via chunked streaming (in TLS-read-sized ~512-byte pieces) to
+// confirm the streaming path holds up at the size synthesizeSpeech() and
+// understandSpeech() actually operate at, not just at toy sizes.
+void test_base64_decode_stream_large_buffer(void) {
+    static uint8_t original[470000];
+    for (size_t i = 0; i < sizeof(original); i++) original[i] = (uint8_t)(i * 31 + 7);
+
+    static char encoded[650000];
+    size_t encLen = base64EncodeCore(original, sizeof(original), encoded, sizeof(encoded));
+
+    static uint8_t decoded[470000];
+    size_t decLen = decodeInChunks(encoded, encLen, 512, decoded, sizeof(decoded));
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)sizeof(original), (uint32_t)decLen);
+    TEST_ASSERT_EQUAL_MEMORY(original, decoded, sizeof(original));
+}
+
 void test_base64_decode_ignores_whitespace(void) {
     // Defensive behavior: decodeChar() returns -1 for anything outside the
     // base64 alphabet, and the decode loop skips those characters rather
@@ -221,6 +291,9 @@ int main(int argc, char** argv) {
     RUN_TEST(test_base64_roundtrip_large_buffer);
     RUN_TEST(test_base64_encode_output_buffer_too_small);
     RUN_TEST(test_base64_decode_output_buffer_too_small);
+    RUN_TEST(test_base64_decode_stream_one_byte_at_a_time);
+    RUN_TEST(test_base64_decode_stream_uneven_chunks);
+    RUN_TEST(test_base64_decode_stream_large_buffer);
     RUN_TEST(test_base64_decode_ignores_whitespace);
 
     RUN_TEST(test_wav_wrap_total_length);

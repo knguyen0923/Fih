@@ -34,3 +34,31 @@ size_t base64EncodeCore(const uint8_t* data, size_t len, char* out, size_t outCa
 // capacity for at least base64DecodedLen(inLen) bytes. Returns the number of
 // bytes written, or 0 if `out` was too small or `in` was malformed.
 size_t base64DecodeCore(const char* in, size_t inLen, uint8_t* out, size_t outCap);
+
+// ============================================================================
+// Streaming decode
+// ============================================================================
+//
+// Same algorithm as base64DecodeCore, but split into init + repeatable update
+// calls so base64 text arriving in arbitrary, network-dictated chunks (e.g.
+// bytes trickling in off a TLS socket) can be decoded incrementally without
+// ever holding the whole encoded string in memory. base64DecodeCore itself is
+// implemented as init() + one update() call over this same state machine.
+
+// Accumulates up to 6 pending bits between update() calls -- a base64
+// character encodes 6 bits, a byte needs 8, so a stream position isn't
+// always sitting on a whole-byte boundary between calls.
+typedef struct {
+    uint32_t bitBuffer;
+    int bits;
+} Base64DecodeStream;
+
+void base64DecodeStreamInit(Base64DecodeStream* state);
+
+// Decodes as many complete bytes as possible from `in` (inLen characters),
+// combined with any bits carried over from a previous call, writing to `out`.
+// `out` must have room for at least base64DecodedLen(inLen) bytes. Returns
+// the number of bytes written, or 0 if `out` was too small. Safe to call
+// repeatedly across an arbitrarily split stream, including splits that land
+// mid-character-group -- leftover bits simply carry into the next call.
+size_t base64DecodeStreamUpdate(Base64DecodeStream* state, const char* in, size_t inLen, uint8_t* out, size_t outCap);

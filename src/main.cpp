@@ -15,12 +15,15 @@
 // their own pass through loop() the way IDLE and RECORDING do. Instead,
 // processInteraction() runs all four of them back-to-back in one go, only
 // updating `state` (and the LED) as a way to report progress -- the actual
-// waiting happens inside the blocking calls to understandSpeech(),
-// synthesizeSpeech(), and audioPlayFromBuffer().
+// waiting happens inside the blocking calls to understandSpeech() and
+// synthesizeSpeech(). SYNTHESIZING and PLAYING in particular are no longer
+// two fully separate steps: synthesizeSpeech() streams the TTS reply and
+// plays each decoded chunk as it arrives (see playTtsChunk() below), rather
+// than decoding the whole reply first and playing it back afterward -- this
+// board has no PSRAM to hold a whole reply's worth of audio in at once.
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_heap_caps.h>
 #include "pins.h"
 #include "config.h"
 #include "audio.h"
@@ -31,22 +34,22 @@ enum State { IDLE, RECORDING, UPLOADING, PROCESSING, SYNTHESIZING, PLAYING, FATA
 static State state = IDLE;
 
 // Worst-case size of a recording: MAX_RECORDING_SECONDS worth of 16-bit
-// samples at SAMPLE_RATE_CAPTURE. This bounds how big the PSRAM allocations
-// below need to be, and is the hard ceiling the RECORDING loop enforces so a
-// stuck/taped-down button can't grow memory use without limit.
+// samples at SAMPLE_RATE_CAPTURE. This bounds how big wavBuf below needs to
+// be, and is the hard ceiling the RECORDING loop enforces so a stuck/taped-
+// down button can't grow memory use without limit. See MAX_RECORDING_SECONDS
+// in pins.h for why this is sized the way it is on a PSRAM-less board.
 static const size_t MAX_PCM_BYTES = (size_t)MAX_RECORDING_SECONDS * SAMPLE_RATE_CAPTURE * sizeof(int16_t);
 static const size_t MAX_WAV_BYTES = MAX_PCM_BYTES + WAV_HEADER_SIZE;
-// Bounds how much decoded TTS audio can be held at once. 300KB comfortably
-// covers a reply of a few sentences at 24kHz/16-bit/mono -- see the memory
-// budget discussion in the project's original planning doc for the full math.
-static const size_t MAX_TTS_PCM_BYTES = 300 * 1024;
 
-// Three PSRAM buffers, allocated once in setup() and reused for every
-// interaction (rather than allocating/freeing per press, which would risk
-// PSRAM fragmentation over a long uptime):
+// The one large buffer this firmware still holds in full: the raw recording,
+// captured before understandSpeech() can be called at all (its final length
+// isn't known until the button is released, and the WAV header needs an
+// exact size). Allocated once in setup() and reused for every interaction,
+// in plain internal heap -- there's no PSRAM on this board to put it in.
+// Both the base64-encoded upload and the decoded TTS reply are streamed
+// instead of buffered (see gemini.cpp), so neither needs a buffer here.
 static uint8_t* pcmBuf = nullptr; // raw mic recording -- actually just points partway into wavBuf, see setup()
 static uint8_t* wavBuf = nullptr; // WAV header + pcmBuf's data, contiguous in one allocation
-static uint8_t* ttsBuf = nullptr; // decoded TTS playback PCM, filled by synthesizeSpeech()
 
 // --- Button debouncing ---
 // A mechanical button's contacts don't cleanly go from "open" to "closed" --
@@ -140,6 +143,17 @@ static void connectWiFi() {
     Serial.println(WiFi.localIP());
 }
 
+// Passed to synthesizeSpeech() as its per-chunk callback: plays each decoded
+// piece of the TTS reply as soon as it arrives instead of waiting for the
+// whole reply to be decoded first. Also nudges the LED so the busy-blink
+// actually animates during this phase now, instead of only snapping to a
+// fixed level the way a single blocking call would (see the file-level
+// comment above and updateLed()'s own comment for why that used to be true).
+static void playTtsChunk(const uint8_t* pcm, size_t len) {
+    updateLed();
+    audioPlayFromBuffer(pcm, len);
+}
+
 // Runs the upload -> understand -> synthesize -> play sequence for one
 // completed recording. `pcmLen` is how many bytes were actually captured
 // (recordings shorter than the max buffer are common and expected).
@@ -172,19 +186,22 @@ static void processInteraction(size_t pcmLen) {
     Serial.print("Gemini reply: ");
     Serial.println(reply);
 
+    // SYNTHESIZING and PLAYING are no longer two separate steps here --
+    // synthesizeSpeech() calls playTtsChunk() once per decoded chunk as the
+    // reply streams in, so decoding and playback happen interleaved. `state`
+    // is set to SYNTHESIZING first since that's the more accurate label for
+    // most of this call's duration (network wait dominates over the brief
+    // per-chunk playback); playTtsChunk() bumps the LED on every call so the
+    // busy-blink still animates throughout, unlike the old single blocking
+    // synthesizeSpeech() + audioPlayFromBuffer() pair.
     state = SYNTHESIZING;
     updateLed();
-    size_t ttsLen = 0;
-    if (!synthesizeSpeech(reply, ttsBuf, ttsLen, MAX_TTS_PCM_BYTES)) {
+    if (!synthesizeSpeech(reply, playTtsChunk)) {
         Serial.println("synthesizeSpeech failed");
         flashError();
         state = IDLE;
         return;
     }
-
-    state = PLAYING;
-    updateLed();
-    audioPlayFromBuffer(ttsBuf, ttsLen); // blocks until playback finishes
 
     state = IDLE;
 }
@@ -196,23 +213,25 @@ void setup() {
     pinMode(PIN_BUTTON, INPUT_PULLUP);
     pinMode(PIN_LED, OUTPUT);
 
-    // Logged so actual PSRAM headroom can be compared against the buffer
-    // sizes allocated just below -- useful during hardware bring-up to
-    // confirm the memory budget assumptions actually hold on your board.
-    Serial.printf("Free PSRAM at boot: %u bytes\n", ESP.getFreePsram());
+    // Logged so actual free-heap headroom can be compared against wavBuf's
+    // size just below -- useful during hardware bring-up to confirm
+    // MAX_RECORDING_SECONDS (pins.h) is actually a safe fit alongside
+    // WiFi/TLS on your specific board, not just a guess.
+    Serial.printf("Free heap at boot: %u bytes\n", ESP.getFreeHeap());
 
     audioInit();
 
-    // MALLOC_CAP_SPIRAM forces these allocations into PSRAM specifically,
-    // rather than the much smaller internal SRAM -- these buffers (up to
-    // ~470KB + ~300KB) would never fit in internal SRAM alongside WiFi/TLS,
-    // which is the whole reason this project requires a PSRAM-equipped board.
-    wavBuf = (uint8_t*)heap_caps_malloc(MAX_WAV_BYTES, MALLOC_CAP_SPIRAM);
-    ttsBuf = (uint8_t*)heap_caps_malloc(MAX_TTS_PCM_BYTES, MALLOC_CAP_SPIRAM);
-    if (!wavBuf || !ttsBuf) {
-        // Nothing useful can happen without these buffers -- this is the one
+    // Plain internal-heap allocation -- this board (ESP32-WROOM-32D) has no
+    // PSRAM, so unlike the original WROVER design there's no MALLOC_CAP_SPIRAM
+    // capability to request. wavBuf is the only large buffer left in this
+    // firmware (the base64-encoded upload and the decoded TTS reply are both
+    // streamed instead -- see gemini.cpp), which is what makes fitting it in
+    // internal SRAM feasible at all.
+    wavBuf = (uint8_t*)malloc(MAX_WAV_BYTES);
+    if (!wavBuf) {
+        // Nothing useful can happen without this buffer -- this is the one
         // truly unrecoverable failure mode, unlike API/network errors below.
-        Serial.println("Failed to allocate PSRAM audio buffers -- halting");
+        Serial.println("Failed to allocate recording buffer -- halting");
         state = FATAL_ERROR;
         return;
     }
@@ -222,7 +241,7 @@ void setup() {
     // fills in the header in front of it.
     pcmBuf = wavBuf + WAV_HEADER_SIZE;
 
-    Serial.printf("Free PSRAM after buffer alloc: %u bytes\n", ESP.getFreePsram());
+    Serial.printf("Free heap after buffer alloc: %u bytes\n", ESP.getFreeHeap());
 
 #if !LOOPBACK_TEST_MODE
     // Loopback mode intentionally skips WiFi entirely -- it's meant to
@@ -250,8 +269,8 @@ void loop() {
     updateLed();
 
     if (state == FATAL_ERROR) {
-        // PSRAM allocation failed in setup() -- nothing to do but sit here
-        // blinking; a physical reset is required to try again.
+        // Recording buffer allocation failed in setup() -- nothing to do but
+        // sit here blinking; a physical reset is required to try again.
         return;
     }
 

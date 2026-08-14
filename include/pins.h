@@ -63,4 +63,13 @@
 // recording loop. This exists so that a stuck or taped-down button can't grow
 // the recording buffer indefinitely — see MAX_PCM_BYTES in main.cpp, which is
 // derived from this value.
-#define MAX_RECORDING_SECONDS 15
+//
+// This board (ESP32-WROOM-32D) has no PSRAM, so unlike a WROVER build, this
+// buffer has to fit in the same ~320KB of internal SRAM as the WiFi/TLS
+// stack. 5 seconds (~160KB, see main.cpp) is a conservative starting point,
+// not a precisely derived constant — same spirit as MIC_GAIN_SHIFT in
+// audio.cpp. Once real hardware is up, watch the ESP.getFreeHeap() logs in
+// main.cpp: if a recording-heavy run still leaves plenty of headroom, this
+// can go up; if understandSpeech()'s TLS handshake ever fails under memory
+// pressure right after a long recording, bring it back down.
+#define MAX_RECORDING_SECONDS 5

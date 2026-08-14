@@ -65,29 +65,38 @@ size_t base64EncodeCore(const uint8_t* data, size_t len, char* out, size_t outCa
 }
 
 size_t base64DecodeCore(const char* in, size_t inLen, uint8_t* out, size_t outCap) {
-    // Trailing '=' padding just marks "no more real data" -- decodeChar()
-    // already returns -1 for it, but trimming it here keeps the loop below
-    // simpler to reason about.
-    while (inLen > 0 && in[inLen - 1] == '=') inLen--;
+    Base64DecodeStream state;
+    base64DecodeStreamInit(&state);
+    return base64DecodeStreamUpdate(&state, in, inLen, out, outCap);
+}
 
+void base64DecodeStreamInit(Base64DecodeStream* state) {
+    state->bitBuffer = 0;
+    state->bits = 0;
+}
+
+size_t base64DecodeStreamUpdate(Base64DecodeStream* state, const char* in, size_t inLen, uint8_t* out, size_t outCap) {
+    // '=' padding characters (and any whitespace/newlines) fall outside the
+    // base64 alphabet, so decodeChar() returns -1 for them and they're
+    // skipped below just like any other non-data byte -- no separate
+    // padding-trim step is needed, which is what makes this safe to call on
+    // an arbitrary, mid-group slice of a larger stream.
     size_t outLen = 0;
-    uint32_t buffer = 0; // accumulates decoded 6-bit groups until we have a full byte
-    int bits = 0;        // how many valid bits are currently sitting in `buffer`
 
     for (size_t i = 0; i < inLen; i++) {
         int8_t val = decodeChar(in[i]);
-        if (val < 0) continue; // skip whitespace/newlines defensively
+        if (val < 0) continue; // skip whitespace/newlines/padding defensively
 
         // Shift in 6 new bits from this character.
-        buffer = (buffer << 6) | (uint32_t)val;
-        bits += 6;
+        state->bitBuffer = (state->bitBuffer << 6) | (uint32_t)val;
+        state->bits += 6;
 
         // Once we've accumulated a full byte (8 bits) worth, peel it off the
         // top of the buffer and emit it.
-        if (bits >= 8) {
-            bits -= 8;
+        if (state->bits >= 8) {
+            state->bits -= 8;
             if (outLen >= outCap) return 0; // caller's buffer too small
-            out[outLen++] = (uint8_t)((buffer >> bits) & 0xFF);
+            out[outLen++] = (uint8_t)((state->bitBuffer >> state->bits) & 0xFF);
         }
     }
 
