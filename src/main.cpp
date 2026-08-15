@@ -152,11 +152,21 @@ static void flashError() {
     }
 }
 
-// Blocks until WiFi connects (or reconnects after a drop). Called once at
-// boot, and again from loop() any time WiFi.status() reports disconnected.
-static void connectWiFi() {
+// Kicks off a WiFi connection attempt without blocking -- pairs with
+// waitForWiFi() below. Split into two functions specifically so loop() can
+// kick this off at button-press (overlapping with recording) and
+// enterVoiceMode() can wait for *that same* attempt afterward, rather than
+// starting a second one -- calling WiFi.begin() again while a connection is
+// already in progress can restart the handshake from scratch on this core,
+// which would defeat the point of starting it early.
+static void beginWiFiConnect() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+// Blocks until the connection kicked off by beginWiFiConnect() completes.
+// Does not call WiFi.begin() itself -- see that function's comment.
+static void waitForWiFi() {
     Serial.print("Connecting to WiFi");
     while (WiFi.status() != WL_CONNECTED) {
         delay(300);
@@ -164,6 +174,14 @@ static void connectWiFi() {
     }
     Serial.print(" connected, IP ");
     Serial.println(WiFi.localIP());
+}
+
+// Connects to WiFi from a cold start and blocks until done -- used only by
+// WIFI_TEXT_TEST_MODE's one-shot boot-time test, where there's no earlier
+// beginWiFiConnect() call to wait on.
+static void connectWiFi() {
+    beginWiFiConnect();
+    waitForWiFi();
 }
 
 // Passed to synthesizeSpeech() as its per-chunk callback: plays each decoded
@@ -189,7 +207,7 @@ static void playTtsChunk(const uint8_t* pcm, size_t len) {
 // through the speaker during UPLOADING/PROCESSING, so nothing should be
 // driving them until synthesizeSpeech() starts calling playTtsChunk().
 static void enterVoiceMode() {
-    connectWiFi();
+    waitForWiFi(); // the connection was already kicked off at button-press, see loop()
     audioSetPlaybackRate(SAMPLE_RATE_PLAYBACK);
     motorStop();
 }
@@ -343,6 +361,16 @@ void loop() {
         return; // nothing to do this pass -- stay idle (Bluetooth speaker, if connected, keeps playing via its own task)
     }
 
+#if WIFI_TEXT_TEST_MODE
+    // This mode only validates the one-shot boot-time text query in
+    // setup() -- Bluetooth is never started here, and I2S1 is never
+    // switched to the voice-reply sample rate, so the button is
+    // intentionally inert rather than partially exercising a radio-switch
+    // path this mode never set up (bluetoothStop() would be tearing down a
+    // Bluetooth stack that was never initialized).
+    return;
+#endif
+
     // --- Button just pressed: record until it's released ---
     state = RECORDING;
     updateLed();
@@ -358,8 +386,7 @@ void loop() {
     // "listening now" cue instead of unexplained silence.
     bluetoothStop();
     audioPlayTone(SAMPLE_RATE_BLUETOOTH, TONE_ENTER_VOICE_HZ, TONE_DURATION_MS);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    beginWiFiConnect();
 #endif
 
     size_t recorded = 0;
