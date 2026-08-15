@@ -3,23 +3,33 @@
 // ============================================================================
 //
 // This is the orchestration layer that ties together audio.h (mic/speaker),
-// gemini.h (the two API calls), and pins.h (hardware wiring) into the actual
-// push-to-talk behavior:
+// gemini.h (the two API calls), bluetooth.h (Bluetooth speaker mode),
+// motor.h (volume-reactive motors), and pins.h (hardware wiring) into the
+// device's actual behavior:
 //
-//   IDLE -> (button pressed) -> RECORDING -> (button released) ->
-//   UPLOADING -> PROCESSING -> SYNTHESIZING -> PLAYING -> back to IDLE
+//   IDLE (Bluetooth speaker: phone streams music, motors react to it)
+//     -> (button pressed) -> RECORDING (stop Bluetooth, start connecting WiFi
+//        in the background while recording -- see loop())
+//     -> (button released) -> UPLOADING -> PROCESSING -> SYNTHESIZING
+//        (the existing Gemini push-to-talk flow, unchanged; motors now also
+//        react to the TTS reply's volume)
+//     -> tear WiFi back down, resume Bluetooth speaker -> back to IDLE
 //
-// The interesting bit to understand up front: because this whole design makes
-// blocking, sequential HTTPS calls (no persistent connection, no background
-// tasks), the UPLOADING/PROCESSING/SYNTHESIZING/PLAYING states don't each get
-// their own pass through loop() the way IDLE and RECORDING do. Instead,
-// processInteraction() runs all four of them back-to-back in one go, only
-// updating `state` (and the LED) as a way to report progress -- the actual
-// waiting happens inside the blocking calls to understandSpeech() and
-// synthesizeSpeech(). SYNTHESIZING and PLAYING in particular are no longer
-// two fully separate steps: synthesizeSpeech() streams the TTS reply and
-// plays each decoded chunk as it arrives (see playTtsChunk() below), rather
-// than decoding the whole reply first and playing it back afterward -- this
+// The reason for that radio dance: the ESP32 has one radio shared between
+// WiFi and Bluetooth Classic, and the two don't reliably run at once (see
+// enterVoiceMode()/exitVoiceMode() below) -- so Bluetooth is fully stopped
+// before every voice interaction and restarted after, rather than the two
+// ever being "on" at the same time.
+//
+// Because the Gemini side of this makes blocking, sequential HTTPS calls (no
+// persistent connection, no background tasks), the UPLOADING/PROCESSING/
+// SYNTHESIZING states don't each get their own pass through loop() the way
+// IDLE and RECORDING do. Instead, processInteraction() runs them back-to-back
+// in one go, only updating `state` (and the LED) as a way to report progress
+// -- the actual waiting happens inside the blocking calls to
+// understandSpeech() and synthesizeSpeech(). synthesizeSpeech() itself
+// streams the TTS reply and plays each decoded chunk as it arrives (see
+// playTtsChunk() below) rather than decoding the whole reply first -- this
 // board has no PSRAM to hold a whole reply's worth of audio in at once.
 
 #include <Arduino.h>
@@ -28,6 +38,8 @@
 #include "config.h"
 #include "audio.h"
 #include "gemini.h"
+#include "bluetooth.h"
+#include "motor.h"
 
 enum State { IDLE, RECORDING, UPLOADING, PROCESSING, SYNTHESIZING, PLAYING, FATAL_ERROR };
 
@@ -50,6 +62,17 @@ static const size_t MAX_WAV_BYTES = MAX_PCM_BYTES + WAV_HEADER_SIZE;
 // instead of buffered (see gemini.cpp), so neither needs a buffer here.
 static uint8_t* pcmBuf = nullptr; // raw mic recording -- actually just points partway into wavBuf, see setup()
 static uint8_t* wavBuf = nullptr; // WAV header + pcmBuf's data, contiguous in one allocation
+
+// UI cue tones played around the Bluetooth/WiFi radio switch (see
+// enterVoiceMode()/exitVoiceMode() below) -- the switch itself isn't
+// instant (a full Bluetooth teardown costs real time, see bluetooth.cpp),
+// so these turn an otherwise-silent, potentially multi-second gap into a
+// deliberate-feeling "listening now" / "back to being a speaker" moment.
+// Different pitches (rising vs falling) make the two cues distinguishable
+// by ear without looking at the LED.
+static const uint32_t TONE_ENTER_VOICE_HZ = 1200;
+static const uint32_t TONE_EXIT_VOICE_HZ = 700;
+static const uint32_t TONE_DURATION_MS = 150;
 
 // --- Button debouncing ---
 // A mechanical button's contacts don't cleanly go from "open" to "closed" --
@@ -149,9 +172,39 @@ static void connectWiFi() {
 // actually animates during this phase now, instead of only snapping to a
 // fixed level the way a single blocking call would (see the file-level
 // comment above and updateLed()'s own comment for why that used to be true).
+// Gemini's TTS audio is mono, but I2S1 is always configured for stereo (2
+// amps -- see audio.cpp), so this upmixes rather than writing raw bytes
+// directly. Motors react to this audio's volume the same way they react to
+// Bluetooth music (see bluetooth.cpp's onAudioData()).
 static void playTtsChunk(const uint8_t* pcm, size_t len) {
     updateLed();
-    audioPlayFromBuffer(pcm, len);
+    audioPlayMonoAsStereo(pcm, len);
+    motorUpdateFromPcm(pcm, len);
+}
+
+// Finishes the radio switch loop() started at button-press (see loop()):
+// blocks until WiFi is connected (usually near-instant here, since the
+// connection was kicked off back when recording started), reconfigures I2S1
+// for a voice reply's sample rate, and stops the motors -- no audio plays
+// through the speaker during UPLOADING/PROCESSING, so nothing should be
+// driving them until synthesizeSpeech() starts calling playTtsChunk().
+static void enterVoiceMode() {
+    connectWiFi();
+    audioSetPlaybackRate(SAMPLE_RATE_PLAYBACK);
+    motorStop();
+}
+
+// Reverses enterVoiceMode(): tears WiFi down and resumes Bluetooth speaker
+// mode. Used both after a normal interaction finishes and to undo the radio
+// switch if a button tap turned out to be too brief to record anything (see
+// loop()) -- in both cases, WiFi's job here is done and Bluetooth should
+// have the radio back.
+static void exitVoiceMode() {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    audioSetPlaybackRate(SAMPLE_RATE_BLUETOOTH);
+    bluetoothStart(); // proactively reconnects to the last-paired phone, see bluetooth.cpp
+    audioPlayTone(SAMPLE_RATE_BLUETOOTH, TONE_EXIT_VOICE_HZ, TONE_DURATION_MS);
 }
 
 // Runs the upload -> understand -> synthesize -> play sequence for one
@@ -220,6 +273,7 @@ void setup() {
     Serial.printf("Free heap at boot: %u bytes\n", ESP.getFreeHeap());
 
     audioInit();
+    motorInit(); // configures PWM and leaves both motors at 0 speed
 
     // Plain internal-heap allocation -- this board (ESP32-WROOM-32D) has no
     // PSRAM, so unlike the original WROVER design there's no MALLOC_CAP_SPIRAM
@@ -243,16 +297,16 @@ void setup() {
 
     Serial.printf("Free heap after buffer alloc: %u bytes\n", ESP.getFreeHeap());
 
-#if !LOOPBACK_TEST_MODE
-    // Loopback mode intentionally skips WiFi entirely -- it's meant to
-    // validate audio hardware in isolation, with no network involved at all.
+#if LOOPBACK_TEST_MODE
+    // Loopback mode intentionally skips WiFi and Bluetooth entirely -- it's
+    // meant to validate audio hardware in isolation, with no radio involved
+    // at all.
+#elif WIFI_TEXT_TEST_MODE
+    // One-shot sanity check: connect WiFi directly (skipping Bluetooth
+    // speaker mode, since this test mode only validates WiFi/TLS/the API key
+    // in isolation) and fire a trivial text query, printing whatever comes
+    // back.
     connectWiFi();
-#endif
-
-#if WIFI_TEXT_TEST_MODE
-    // One-shot sanity check: fire a trivial text query at boot and print
-    // whatever comes back, to confirm WiFi/TLS/API key all work before
-    // testing the full audio pipeline.
     String reply;
     if (textOnlyQuery("Say hello in five words or fewer.", reply)) {
         Serial.print("Gemini replied: ");
@@ -260,6 +314,12 @@ void setup() {
     } else {
         Serial.println("WIFI_TEXT_TEST_MODE query failed");
     }
+#else
+    // Normal operation: Bluetooth speaker is the default idle behavior --
+    // WiFi only comes up on-demand around a voice interaction (see loop()),
+    // since this chip's one radio can't reliably run WiFi and Bluetooth
+    // Classic at the same time.
+    bluetoothStart();
 #endif
 
     Serial.println("Ready. Press and hold the button to talk.");
@@ -274,22 +334,33 @@ void loop() {
         return;
     }
 
-#if !LOOPBACK_TEST_MODE
-    // WiFi.status() is cheap to check every loop() pass; reconnecting here
-    // means a dropped WiFi connection self-heals without a manual reset.
-    if (WiFi.status() != WL_CONNECTED) {
-        connectWiFi();
-    }
-#endif
+    // No background WiFi-reconnect check here any more -- at idle, WiFi
+    // being disconnected is the *expected* state (Bluetooth owns the radio
+    // then, see enterVoiceMode()/exitVoiceMode()), not a fault to correct.
+    // WiFi is brought up fresh for each voice interaction instead.
 
     if (!readButtonPressed()) {
-        return; // nothing to do this pass -- stay idle
+        return; // nothing to do this pass -- stay idle (Bluetooth speaker, if connected, keeps playing via its own task)
     }
 
     // --- Button just pressed: record until it's released ---
     state = RECORDING;
     updateLed();
     Serial.println("Recording...");
+
+#if !LOOPBACK_TEST_MODE
+    // Kick off the radio switch now, in parallel with recording below,
+    // instead of waiting until the button is released -- by the time
+    // recording ends, WiFi has often already finished connecting, hiding
+    // most of the switch latency (finished off by enterVoiceMode() below).
+    // bluetoothStop()'s full teardown isn't instant (see bluetooth.cpp) --
+    // the tone right after it turns that gap into a deliberate-feeling
+    // "listening now" cue instead of unexplained silence.
+    bluetoothStop();
+    audioPlayTone(SAMPLE_RATE_BLUETOOTH, TONE_ENTER_VOICE_HZ, TONE_DURATION_MS);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#endif
 
     size_t recorded = 0;
     const size_t chunkBytes = 512; // ~16ms of audio per chunk at 16kHz/16-bit -- small enough for prompt release detection
@@ -302,21 +373,34 @@ void loop() {
                   recorded / (float)(SAMPLE_RATE_CAPTURE * sizeof(int16_t)));
 
     if (recorded == 0) {
-        // Button was tapped so briefly nothing was actually captured.
+        // Button was tapped so briefly nothing was actually captured -- no
+        // interaction will run, so undo the radio switch started above.
+#if !LOOPBACK_TEST_MODE
+        exitVoiceMode();
+#endif
         state = IDLE;
         return;
     }
 
 #if LOOPBACK_TEST_MODE
-    // Play back exactly what was recorded, no network involved -- this is
-    // Build Phase 1: confirming the mic and amp work before anything else.
+    // Play back exactly what was recorded, no radio involved at all -- this
+    // is Build Phase 1: confirming the mic and amp work before anything
+    // else. Upmixed to stereo and played at the capture rate (I2S1 is always
+    // stereo now -- see audio.cpp -- and defaults to SAMPLE_RATE_BLUETOOTH,
+    // which would otherwise play this back at the wrong pitch/speed).
     state = PLAYING;
     updateLed();
-    audioPlayFromBuffer(pcmBuf, recorded);
+    audioSetPlaybackRate(SAMPLE_RATE_CAPTURE);
+    audioPlayMonoAsStereo(pcmBuf, recorded);
+    audioSetPlaybackRate(SAMPLE_RATE_BLUETOOTH);
     state = IDLE;
 #else
-    // Normal operation: run the full record -> understand -> speak -> play
-    // pipeline for what was just captured.
+    // Normal operation: finish the radio switch, run the full record ->
+    // understand -> speak -> play pipeline for what was just captured, then
+    // switch back to being a Bluetooth speaker.
+    enterVoiceMode();
     processInteraction(recorded);
+    exitVoiceMode();
+    state = IDLE;
 #endif
 }

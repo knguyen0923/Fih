@@ -30,6 +30,30 @@ void audioInit();
 // to buf (may be less than chunkBytes on an I2S read error/timeout).
 size_t audioReadChunk(uint8_t* buf, size_t chunkBytes);
 
-// Plays raw 16-bit/24kHz/mono PCM straight out the amp — this is exactly the
-// format Gemini TTS returns, no unwrapping needed beyond base64 decode.
+// Plays raw 16-bit stereo PCM straight out the amp, at whatever sample rate
+// I2S1 is currently configured for (see audioSetPlaybackRate()) -- this is
+// the format both Bluetooth audio (already stereo) and audioPlayMonoAsStereo()
+// (below) hand it.
 void audioPlayFromBuffer(const uint8_t* pcm, size_t len);
+
+// Changes I2S1's sample rate without a full driver reinstall (channel format
+// stays fixed at stereo -- see configureAmpI2S() in audio.cpp). Used to
+// switch the amp between SAMPLE_RATE_BLUETOOTH (idle, A2DP) and
+// SAMPLE_RATE_PLAYBACK (during a Gemini TTS reply).
+void audioSetPlaybackRate(uint32_t sampleRate);
+
+// Plays raw 16-bit MONO PCM (e.g. Gemini's TTS output) through the same
+// stereo-configured I2S1 bus that audioPlayFromBuffer() writes to, by
+// duplicating each sample into an L+R pair first. Needed because this board
+// wires 2 amps for true stereo, so I2S1 is always in stereo format -- mono
+// audio has to be upmixed rather than sent as-is.
+void audioPlayMonoAsStereo(const uint8_t* monoPcm, size_t len);
+
+// Plays a short sine-wave tone through the amp, blocking until it finishes.
+// `sampleRate` must match whatever I2S1 is currently configured for (see
+// audioSetPlaybackRate()) -- used as a brief UI cue around the Bluetooth/
+// WiFi radio switch (see main.cpp), so an otherwise-silent multi-second gap
+// while Bluetooth fully tears down/reconnects reads as an intentional "the
+// assistant is listening now" (or "back to being a speaker") moment,
+// instead of the device seeming to have hung or broken.
+void audioPlayTone(uint32_t sampleRate, uint32_t freqHz, uint32_t durationMs);

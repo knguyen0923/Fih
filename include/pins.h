@@ -9,9 +9,10 @@
 // only file you should need to edit — src/audio.cpp, src/main.cpp, etc. all
 // refer to these #defines rather than hardcoding pin numbers themselves.
 //
-// Default wiring assumes a generic ESP32 WROVER dev board with:
+// Default wiring assumes a generic ESP32 WROOM-32D dev board with:
 //   - an INMP441 (or similar) I2S MEMS microphone
-//   - a MAX98357A (or similar) I2S amplifier + speaker
+//   - two MAX98357A (or similar) I2S amplifiers, wired for stereo output
+//   - a dual H-bridge DC motor driver + 2 DC motors, reacting to volume
 //
 // Pins were chosen to avoid:
 //   - "strapping pins" (0, 2, 5, 12, 15) whose logic level at boot affects how
@@ -36,9 +37,34 @@
 // peripherals (I2S0 for RX, I2S1 for TX) instead of time-sharing one bus is
 // simpler because this design is strictly sequential — record, THEN play back,
 // never both at once — so there's no need for full-duplex bus sharing logic.
+//
+// Two MAX98357A amp boards share these same three pins for true stereo
+// output (one BCLK/WS/DATA bus carries both L and R channels, time-
+// multiplexed — that's what I2S stereo means). Each board's channel-select
+// pin (often labeled SD or GAIN, depending on the breakout revision) needs
+// to be strapped per its own datasheet/silkscreen to pick left vs right —
+// this varies enough between clones/revisions that it's called out here as
+// a spot-check rather than a specific voltage/resistor value.
 #define PIN_AMP_BCLK 27
 #define PIN_AMP_WS   14
 #define PIN_AMP_DATA 13
+
+// --- Volume-reactive DC motors (dual H-bridge, e.g. Aideepen/L298N-style) ---
+// Each motor gets 2 GPIOs (its H-bridge's two control inputs). Speed control
+// with no reverse needed: PWM one pin with the volume-mapped duty cycle,
+// hold the other LOW. This pattern works the same way across effectively
+// every 2-pin-per-motor H-bridge chip (L298N, DRV8833, AT8870, TB6612...),
+// which is why it's used here instead of assuming this specific board's
+// exact pin semantics.
+//
+// The H-bridge's motor-supply rail must come from its own power source (the
+// user's separate 5V supply) — NOT the ESP32's own 3.3V/5V rail, which isn't
+// meant to source motor current. Tie all grounds (5V supply, H-bridge,
+// ESP32) together.
+#define PIN_MOTOR_A_IN1 16
+#define PIN_MOTOR_A_IN2 17
+#define PIN_MOTOR_B_IN1 18
+#define PIN_MOTOR_B_IN2 19
 
 // --- Button and status LED ---
 // The button is wired active-low: one leg to this GPIO, the other to GND.
@@ -57,7 +83,11 @@
 // TTS model returns audio at, so playback must match it exactly or the speech
 // will sound sped-up/slowed-down.
 #define SAMPLE_RATE_CAPTURE   16000  // Hz, mic -> Gemini (16-bit, mono)
-#define SAMPLE_RATE_PLAYBACK  24000  // Hz, Gemini TTS -> speaker (16-bit, mono) — fixed by the API, don't change
+#define SAMPLE_RATE_PLAYBACK  24000  // Hz, Gemini TTS -> speaker (16-bit, mono upmixed to stereo) — fixed by the API, don't change
+#define SAMPLE_RATE_BLUETOOTH 44100  // Hz, A2DP's fixed rate (16-bit, stereo) — not configurable, part of the Bluetooth audio spec
+
+// Name advertised when a phone scans for this device to pair with.
+#define BT_DEVICE_NAME "Fih Speaker"
 
 // Hard cap on how long a single recording can be, enforced in main.cpp's
 // recording loop. This exists so that a stuck or taped-down button can't grow

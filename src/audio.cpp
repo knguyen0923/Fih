@@ -1,6 +1,7 @@
 #include "audio.h"
 #include "pins.h"
 #include <driver/i2s.h>
+#include <math.h>
 
 // INMP441 (and most I2S MEMS mics) deliver 24 significant bits of audio,
 // left-justified inside a 32-bit I2S frame (i.e. the real data lives in the
@@ -51,15 +52,21 @@ static void configureMicI2S() {
     i2s_set_pin(I2S_NUM_0, &pinCfg);
 }
 
-// Sets up I2S1 as a transmit-only peripheral driving the amplifier.
+// Sets up I2S1 as a transmit-only peripheral driving the amplifier. Starts
+// at SAMPLE_RATE_BLUETOOTH since Bluetooth speaker mode is this device's
+// default idle state -- see audioSetPlaybackRate() for switching to
+// SAMPLE_RATE_PLAYBACK during a Gemini TTS reply.
 static void configureAmpI2S() {
     i2s_config_t cfg = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = SAMPLE_RATE_PLAYBACK,
+        .sample_rate = SAMPLE_RATE_BLUETOOTH,
         // Gemini's TTS output is already 16-bit PCM, so no bit-depth
         // conversion is needed on this side (unlike the mic's 32->16 shift).
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        // True stereo now (2 MAX98357A boards, one per channel) -- Bluetooth
+        // audio is natively stereo; mono Gemini TTS audio gets upmixed to
+        // stereo before reaching I2S1 (see audioPlayMonoAsStereo()).
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 4,
@@ -125,5 +132,58 @@ void audioPlayFromBuffer(const uint8_t* pcm, size_t len) {
         i2s_write(I2S_NUM_1, pcm + offset, chunk, &written, portMAX_DELAY);
         if (written == 0) break; // avoid spinning forever on an I2S error
         offset += written;
+    }
+}
+
+void audioSetPlaybackRate(uint32_t sampleRate) {
+    // Changes the sample rate on the fly -- channel format (stereo) stays
+    // fixed, so this is far cheaper than a full i2s_driver_uninstall() +
+    // configureAmpI2S() reinstall every time playback switches between
+    // Bluetooth (SAMPLE_RATE_BLUETOOTH) and a Gemini TTS reply
+    // (SAMPLE_RATE_PLAYBACK).
+    i2s_set_sample_rates(I2S_NUM_1, sampleRate);
+}
+
+void audioPlayMonoAsStereo(const uint8_t* monoPcm, size_t len) {
+    const int16_t* monoSamples = (const int16_t*)monoPcm;
+    size_t sampleCount = len / sizeof(int16_t);
+
+    // Small fixed-size stack buffer, processed in chunks -- same reasoning
+    // as audioReadChunk()'s rawBuf, avoids needing an allocation sized to
+    // the caller's chunk length.
+    int16_t stereoBuf[256]; // 128 upmixed L+R sample-pairs per chunk
+    const size_t samplesPerChunk = 128;
+
+    size_t offset = 0;
+    while (offset < sampleCount) {
+        size_t n = min(sampleCount - offset, samplesPerChunk);
+        for (size_t i = 0; i < n; i++) {
+            stereoBuf[i * 2] = monoSamples[offset + i];     // left
+            stereoBuf[i * 2 + 1] = monoSamples[offset + i]; // right -- same sample, upmixed mono
+        }
+        audioPlayFromBuffer((const uint8_t*)stereoBuf, n * 2 * sizeof(int16_t));
+        offset += n;
+    }
+}
+
+void audioPlayTone(uint32_t sampleRate, uint32_t freqHz, uint32_t durationMs) {
+    const size_t totalSamples = (size_t)((uint64_t)sampleRate * durationMs / 1000);
+    const size_t samplesPerChunk = 128;
+    int16_t stereoBuf[samplesPerChunk * 2];
+
+    size_t samplesDone = 0;
+    while (samplesDone < totalSamples) {
+        size_t n = min(totalSamples - samplesDone, samplesPerChunk);
+        for (size_t i = 0; i < n; i++) {
+            size_t sampleIndex = samplesDone + i;
+            float phase = 2.0f * PI * freqHz * ((float)sampleIndex / (float)sampleRate);
+            // Moderate amplitude (not full-scale) -- this is a gentle UI
+            // cue, not an alarm.
+            int16_t sample = (int16_t)(sinf(phase) * 8000.0f);
+            stereoBuf[i * 2] = sample;
+            stereoBuf[i * 2 + 1] = sample;
+        }
+        audioPlayFromBuffer((const uint8_t*)stereoBuf, n * 2 * sizeof(int16_t));
+        samplesDone += n;
     }
 }

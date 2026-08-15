@@ -34,7 +34,7 @@
 // error.
 #define GEMINI_TEXT_MODEL "gemini-2.5-flash-lite"        // used by understandSpeech() and textOnlyQuery()
 #define GEMINI_TTS_MODEL  "gemini-2.5-flash-preview-tts" // used by synthesizeSpeech()
-#define GEMINI_TTS_VOICE  "Kore"                          // one of Gemini's prebuilt TTS voices
+#define GEMINI_TTS_VOICE  "Algieba"                       // one of Gemini's prebuilt TTS voices
 
 // Upper bound on how many tokens Gemini's reply may contain. This exists for a
 // very physical reason: a longer text reply means a longer TTS audio reply,

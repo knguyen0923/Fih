@@ -17,6 +17,7 @@
 #include <string.h>
 #include "base64_core.h"
 #include "wav.h"
+#include "volume_core.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -195,6 +196,39 @@ void test_base64_decode_ignores_whitespace(void) {
 }
 
 // ----------------------------------------------------------------------------
+// volume_core
+// ----------------------------------------------------------------------------
+
+void test_volume_level_silence_is_zero(void) {
+    int16_t silence[64] = {0};
+    TEST_ASSERT_EQUAL_UINT8(0, computeVolumeLevel(silence, 64));
+}
+
+void test_volume_level_full_scale_square_wave_near_max(void) {
+    int16_t samples[64];
+    for (int i = 0; i < 64; i++) samples[i] = (i % 2 == 0) ? 32767 : -32767;
+    // RMS of a full-scale square wave equals its amplitude, so this should
+    // land right at the top of the 0-255 scale (254 or 255 depending on
+    // rounding, never a partial-scale value).
+    uint8_t level = computeVolumeLevel(samples, 64);
+    TEST_ASSERT_TRUE(level >= 254);
+}
+
+// A constant amplitude of exactly half of INT16_MAX+1 (16384) has an RMS
+// equal to itself, which scales to exactly half of 0-255 -- a precise,
+// non-edge-case value to check the scaling math isn't off by a constant
+// factor or inverted.
+void test_volume_level_half_scale_constant(void) {
+    int16_t samples[32];
+    for (int i = 0; i < 32; i++) samples[i] = 16384;
+    TEST_ASSERT_EQUAL_UINT8(128, computeVolumeLevel(samples, 32));
+}
+
+void test_volume_level_empty_input_is_zero(void) {
+    TEST_ASSERT_EQUAL_UINT8(0, computeVolumeLevel(nullptr, 0));
+}
+
+// ----------------------------------------------------------------------------
 // wav
 // ----------------------------------------------------------------------------
 
@@ -295,6 +329,11 @@ int main(int argc, char** argv) {
     RUN_TEST(test_base64_decode_stream_uneven_chunks);
     RUN_TEST(test_base64_decode_stream_large_buffer);
     RUN_TEST(test_base64_decode_ignores_whitespace);
+
+    RUN_TEST(test_volume_level_silence_is_zero);
+    RUN_TEST(test_volume_level_full_scale_square_wave_near_max);
+    RUN_TEST(test_volume_level_half_scale_constant);
+    RUN_TEST(test_volume_level_empty_input_is_zero);
 
     RUN_TEST(test_wav_wrap_total_length);
     RUN_TEST(test_wav_wrap_header_fields);
