@@ -318,6 +318,68 @@ static bool feedBase64UntilQuote(Base64DecodeStream* decodeState, const char* da
     return i < len;
 }
 
+// How long streamTtsResponse() will wait, in total, for Gemini to finish
+// sending the TTS reply body before giving up. Each individual read below is
+// already bounded by the underlying WiFiClientSecure's own read timeout
+// (Stream::readBytes()/readStringUntil() give up and return after that many
+// ms with whatever they've got, ~30s by default) -- but that alone doesn't
+// cap how long a series of many small-but-nonzero reads can keep the loops
+// below spinning for if the server just trickles data slowly. This is the
+// actual wall-clock ceiling, matching the spirit of waitForWiFi()'s 15s
+// timeout in main.cpp (added for the same reason: an unbounded wait here
+// would hang the device indefinitely with no error, no LED change, and no
+// recovery short of a power cycle).
+static const unsigned long TTS_STREAM_TIMEOUT_MS = 20000;
+
+// Tracks state for stripping HTTP chunked-transfer-encoding framing
+// ("<hex-size>\r\n<data>\r\n", repeated, ended by a zero-size chunk) off a
+// raw response stream. HTTPClient::getStream() hands back the transport
+// socket completely unprocessed -- only HTTPClient's own writeToStream()/
+// getString() do dechunking internally, and neither fits this function's
+// need to interleave a wall-clock deadline check between reads (see
+// TTS_STREAM_TIMEOUT_MS) -- so this reimplements just enough of it by hand.
+// Left unstripped, chunk-size hex digits and CRLF framing would get scanned
+// as if they were response bytes: at best that desyncs the "data" needle
+// search below, and at worst -- since hex digits are themselves valid base64
+// characters -- any that land inside the audio payload get silently decoded
+// as bogus PCM instead of being recognized as framing, corrupting playback.
+struct ChunkedReadState {
+    bool chunked;
+    uint32_t chunkRemaining;
+    bool ended;
+};
+
+// Reads up to `len` bytes of actual response payload from `stream` into
+// `out`, transparently stripping chunk framing when `state->chunked` is set.
+// Returns 0 if nothing was available within this call's own read timeout
+// (the caller's surrounding loop decides whether to retry or give up -- see
+// the deadline/connected() checks around each call site below), or once a
+// chunked body's terminating zero-size chunk has been seen.
+static size_t readDechunked(WiFiClient& stream, ChunkedReadState* state, uint8_t* out, size_t len) {
+    if (!state->chunked) {
+        return stream.readBytes(out, len);
+    }
+    if (state->ended) return 0;
+    if (state->chunkRemaining == 0) {
+        String line = stream.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) return 0; // chunk-size line hasn't fully arrived yet
+        state->chunkRemaining = (uint32_t)strtol(line.c_str(), nullptr, 16);
+        if (state->chunkRemaining == 0) {
+            state->ended = true;
+            return 0;
+        }
+    }
+    size_t want = min((size_t)state->chunkRemaining, len);
+    size_t n = stream.readBytes(out, want);
+    state->chunkRemaining -= n;
+    if (n > 0 && state->chunkRemaining == 0) {
+        char crlf[2];
+        stream.readBytes((uint8_t*)crlf, 2); // trailing CRLF after each chunk's data
+    }
+    return n;
+}
+
 // Reads Gemini's TTS response incrementally instead of buffering the whole
 // (potentially hundreds-of-KB) body first -- this board has no PSRAM to hold
 // a reply-sized buffer in. Response shape:
@@ -327,7 +389,14 @@ static bool feedBase64UntilQuote(Base64DecodeStream* decodeState, const char* da
 // into a bounded head buffer (cheap to re-scan for the marker on every read);
 // once "data" is found, its base64 text -- the large part -- is decoded and
 // handed to onPcmChunk() a chunk at a time as it streams in.
-static bool streamTtsResponse(WiFiClient& stream, void (*onPcmChunk)(const uint8_t*, size_t)) {
+static bool streamTtsResponse(HTTPClient& https, void (*onPcmChunk)(const uint8_t*, size_t)) {
+    WiFiClient& stream = https.getStream();
+    // Gemini sends either a Content-Length header or chunked encoding, never
+    // both -- no Content-Length (getSize() < 0) means chunked. This response
+    // is large and dynamically generated, exactly the case chunked encoding
+    // exists for, so it's worth handling rather than assuming Content-Length.
+    ChunkedReadState chunkState{ https.getSize() < 0, 0, false };
+
     static const size_t HEAD_CAP = 1024;
     char head[HEAD_CAP];
     size_t headLen = 0;
@@ -337,10 +406,15 @@ static bool streamTtsResponse(WiFiClient& stream, void (*onPcmChunk)(const uint8
     static const size_t DATA_NEEDLE_LEN = 8;
 
     uint8_t readBuf[512];
+    unsigned long deadline = millis() + TTS_STREAM_TIMEOUT_MS;
 
     while (headLen < HEAD_CAP && dataStart < 0) {
+        if (millis() > deadline) {
+            Serial.println("TTS response: timed out waiting for \"data\" field");
+            return false;
+        }
         size_t want = min(sizeof(readBuf), HEAD_CAP - headLen);
-        size_t n = stream.readBytes(readBuf, want);
+        size_t n = readDechunked(stream, &chunkState, readBuf, want);
         if (n == 0) {
             if (!stream.connected() && !stream.available()) break;
             continue;
@@ -378,9 +452,13 @@ static bool streamTtsResponse(WiFiClient& stream, void (*onPcmChunk)(const uint8
     }
 
     while (stream.connected() || stream.available()) {
-        size_t n = stream.readBytes(readBuf, sizeof(readBuf));
+        if (millis() > deadline) {
+            Serial.println("TTS response: timed out mid-stream");
+            return false;
+        }
+        size_t n = readDechunked(stream, &chunkState, readBuf, sizeof(readBuf));
         if (n == 0) {
-            if (!stream.connected()) break;
+            if (!stream.connected() || chunkState.ended) break;
             continue;
         }
         if (feedBase64UntilQuote(&decodeState, (const char*)readBuf, n, onPcmChunk)) {
@@ -431,7 +509,7 @@ bool synthesizeSpeech(const String& text, void (*onPcmChunk)(const uint8_t* pcm,
 
         int code = https.POST((uint8_t*)body.c_str(), body.length());
         if (code == 200) {
-            bool ok = streamTtsResponse(https.getStream(), onPcmChunk);
+            bool ok = streamTtsResponse(https, onPcmChunk);
             https.end();
             return ok;
         }

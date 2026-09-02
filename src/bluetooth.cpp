@@ -16,6 +16,14 @@ static BluetoothA2DPSink a2dp_sink;
 static esp_bd_addr_t lastPeerAddr;
 static bool hasLastPeer = false;
 
+// Set by bluetoothMute()/bluetoothUnmute() -- a cheap flag flip, unlike the
+// full bluetoothStop() teardown below. main.cpp mutes immediately at
+// button-press (before mic capture starts) so background Bluetooth music
+// doesn't bleed into the recording, without paying bluetoothStop()'s
+// multi-second cost right when speech capture needs to start with zero
+// delay -- see the comment on bluetoothStop() and main.cpp's loop().
+static volatile bool muted = false;
+
 // Called by the A2DP library on its own internal FreeRTOS task whenever a
 // new block of decoded audio is ready -- interleaved 16-bit stereo PCM at
 // SAMPLE_RATE_BLUETOOTH. This runs on a different task than the main
@@ -23,13 +31,25 @@ static bool hasLastPeer = false;
 // bluetoothStop() fully tears the A2DP sink down before any voice-mode I2S1
 // or motor activity starts (see main.cpp's enterVoiceMode()/
 // exitVoiceMode()), so this callback and the Gemini-TTS playback path are
-// never live at the same time -- no locking needed between them.
+// never live at the same time -- no locking needed between them. Muting
+// (rather than the A2DP connection itself) is what protects the window
+// between button-press and bluetoothStop() actually running.
 static void onAudioData(const uint8_t* data, uint32_t len) {
+    if (muted) return;
     audioPlayFromBuffer(data, len);
     motorUpdateFromPcm(data, len);
 }
 
+void bluetoothMute() {
+    muted = true;
+}
+
+void bluetoothUnmute() {
+    muted = false;
+}
+
 void bluetoothStart() {
+    muted = false; // defensive -- a fresh session should never start muted
     audioSetPlaybackRate(SAMPLE_RATE_BLUETOOTH);
     // `false` -- don't let the library also drive its own I2S output;
     // audio.cpp already owns I2S1, so this just wants the raw PCM callback.

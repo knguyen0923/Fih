@@ -32,7 +32,10 @@ size_t base64EncodeCore(const uint8_t* data, size_t len, char* out, size_t outCa
 
 // Decodes `inLen` base64 characters from `in` into `out`. `out` must have
 // capacity for at least base64DecodedLen(inLen) bytes. Returns the number of
-// bytes written, or 0 if `out` was too small or `in` was malformed.
+// bytes written -- if `out` was undersized, that's however many bytes fit
+// before decoding stopped (not 0; see base64DecodeStreamUpdate below, which
+// this is implemented on top of). Malformed input (stray characters outside
+// the base64 alphabet) is simply skipped, not treated as an error.
 size_t base64DecodeCore(const char* in, size_t inLen, uint8_t* out, size_t outCap);
 
 // ============================================================================
@@ -57,8 +60,15 @@ void base64DecodeStreamInit(Base64DecodeStream* state);
 
 // Decodes as many complete bytes as possible from `in` (inLen characters),
 // combined with any bits carried over from a previous call, writing to `out`.
-// `out` must have room for at least base64DecodedLen(inLen) bytes. Returns
-// the number of bytes written, or 0 if `out` was too small. Safe to call
+// `out` must have room for at least base64DecodedLen(inLen) bytes -- callers
+// must size `outCap` accordingly, since decoding a fixed number of input
+// characters always produces the same number of output bytes regardless of
+// how the stream happens to be chunked. Returns the number of bytes written.
+// If `out` fills up before all of `in` is consumed (a contract violation --
+// see above), decoding stops early and any not-yet-processed characters are
+// silently dropped, but `state` is left valid and correctly aligned for the
+// next call -- this is a safety net against corrupting the rest of the
+// stream, not a substitute for sizing `outCap` correctly. Safe to call
 // repeatedly across an arbitrarily split stream, including splits that land
 // mid-character-group -- leftover bits simply carry into the next call.
 size_t base64DecodeStreamUpdate(Base64DecodeStream* state, const char* in, size_t inLen, uint8_t* out, size_t outCap);

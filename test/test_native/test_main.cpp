@@ -86,9 +86,12 @@ void test_base64_roundtrip_full_byte_range(void) {
     TEST_ASSERT_EQUAL_MEMORY(original, decoded, sizeof(original));
 }
 
-// A ~470KB recording is the realistic worst case (MAX_RECORDING_SECONDS x
-// SAMPLE_RATE_CAPTURE x 2 bytes, see pins.h) -- this exercises the codec at
-// roughly that scale rather than only ever testing tiny buffers.
+// Exercises the codec at a realistic recording scale rather than only ever
+// testing tiny buffers. 470KB is deliberately well above the current
+// worst-case recording size (MAX_RECORDING_SECONDS x SAMPLE_RATE_CAPTURE x 2
+// bytes = 5 x 16000 x 2 = 160,000 bytes, per pins.h) -- kept larger than that
+// figure on purpose as a margin against pins.h's tunable values changing,
+// rather than being retuned to track them exactly.
 void test_base64_roundtrip_large_buffer(void) {
     static uint8_t original[470000];
     for (size_t i = 0; i < sizeof(original); i++) original[i] = (uint8_t)(i * 31 + 7);
@@ -110,9 +113,16 @@ void test_base64_encode_output_buffer_too_small(void) {
 }
 
 void test_base64_decode_output_buffer_too_small(void) {
-    uint8_t out[1]; // "TWFu" decodes to 3 bytes
+    // "TWFu" decodes to 3 bytes ("Man"), but out only has room for 1 -- the
+    // decoder returns as many bytes as fit (not 0) and stops cleanly rather
+    // than corrupting anything; see base64_core.h's doc comment and
+    // test_base64_decode_stream_output_buffer_too_small_does_not_corrupt_state
+    // above for why "return 0" was the wrong contract for the streaming
+    // decoder this is built on.
+    uint8_t out[1];
     size_t n = base64DecodeCore("TWFu", 4, out, sizeof(out));
-    TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)n);
+    TEST_ASSERT_EQUAL_UINT32(1, (uint32_t)n);
+    TEST_ASSERT_EQUAL_MEMORY("M", out, 1);
 }
 
 // Feeds `encoded` (encLen chars) through base64DecodeStreamUpdate() split
@@ -185,6 +195,70 @@ void test_base64_decode_stream_large_buffer(void) {
     TEST_ASSERT_EQUAL_MEMORY(original, decoded, sizeof(original));
 }
 
+// Regression test for a real bug: base64DecodeStreamUpdate() used to
+// decrement its internal bit-count *before* checking whether `out` had room,
+// so an undersized buffer mid-stream would both discard the in-flight byte
+// AND permanently misalign every byte decoded afterward (state->bits ended
+// up wrong for good). The fix stops before committing that character's bits
+// to `state` when there's no room, so previously-decoded bytes are kept,
+// nothing is corrupted, and -- as checked here -- feeding the same
+// characters again once there's enough room resumes decoding correctly
+// rather than picking up out of alignment.
+void test_base64_decode_stream_output_buffer_too_small_does_not_corrupt_state(void) {
+    uint8_t original[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9}; // 3 whole base64 groups
+    char encoded[16];
+    size_t encLen = base64EncodeCore(original, sizeof(original), encoded, sizeof(encoded));
+    TEST_ASSERT_EQUAL_UINT32(12, (uint32_t)encLen); // 9 bytes -> 3 groups -> 12 chars
+
+    Base64DecodeStream state;
+    base64DecodeStreamInit(&state);
+
+    // First group (4 chars -> 3 bytes) decodes fine into a buffer sized for
+    // exactly one group.
+    uint8_t out[3];
+    size_t n1 = base64DecodeStreamUpdate(&state, encoded, 4, out, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT32(3, (uint32_t)n1);
+    TEST_ASSERT_EQUAL_MEMORY(original, out, 3);
+
+    // Second group (chars 4-11, two whole groups = 6 bytes) is fed against a
+    // buffer with room for only 1 byte -- forces the overflow path on the
+    // very first byte of this call.
+    uint8_t tiny[1];
+    size_t n2 = base64DecodeStreamUpdate(&state, encoded + 4, 8, tiny, sizeof(tiny));
+    TEST_ASSERT_EQUAL_UINT32(1, (uint32_t)n2);
+    TEST_ASSERT_EQUAL_UINT8(original[3], tiny[0]);
+
+    // Re-decoding that same 8-character slice against a properly-sized
+    // buffer must still produce the correct 6 bytes -- proving the earlier
+    // undersized call didn't leave `state` misaligned. (A fresh state is
+    // used here since the previous call already consumed/emitted the first
+    // byte of this slice into `tiny` above; this checks the codec itself
+    // stays correct, not that partial output can be resumed byte-for-byte,
+    // which the API doesn't support -- see base64_core.h's doc comment.)
+    Base64DecodeStream freshState;
+    base64DecodeStreamInit(&freshState);
+    uint8_t rest[6];
+    size_t n3 = base64DecodeStreamUpdate(&freshState, encoded + 4, 8, rest, sizeof(rest));
+    TEST_ASSERT_EQUAL_UINT32(6, (uint32_t)n3);
+    TEST_ASSERT_EQUAL_MEMORY(original + 3, rest, 6);
+}
+
+// A non-multiple-of-4, unpadded tail (2 leftover base64 characters, encoding
+// 12 bits -- not enough for a full byte) should be safely discarded rather
+// than emitting a spurious partial byte. Plausible shape for truncated
+// network data, not just a contrived input.
+void test_base64_decode_malformed_unpadded_tail(void) {
+    uint8_t out[8];
+    // "TWFu" ("Man", 3 bytes) followed by one extra character with no '='
+    // padding and no more data -- that trailing character contributes only
+    // 6 bits, never enough on its own for a full byte, and should simply not
+    // appear in the output (as opposed to, say, emitting a garbage byte from
+    // whatever was left in the bit buffer).
+    size_t n = base64DecodeCore("TWFuT", 5, out, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT32(3, (uint32_t)n);
+    TEST_ASSERT_EQUAL_MEMORY("Man", out, 3);
+}
+
 void test_base64_decode_ignores_whitespace(void) {
     // Defensive behavior: decodeChar() returns -1 for anything outside the
     // base64 alphabet, and the decode loop skips those characters rather
@@ -226,6 +300,20 @@ void test_volume_level_half_scale_constant(void) {
 
 void test_volume_level_empty_input_is_zero(void) {
     TEST_ASSERT_EQUAL_UINT8(0, computeVolumeLevel(nullptr, 0));
+}
+
+// INT16_MIN (-32768) is one further than the -32767 used by the square-wave
+// test above -- it's the true largest-magnitude 16-bit sample (int16_t's
+// range is asymmetric: -32768..32767), and the one value a naive abs()-based
+// RMS implementation could mishandle (abs(INT16_MIN) itself overflows a
+// 16-bit signed type). computeVolumeLevel() double-casts before squaring, so
+// this should land at the same top-of-scale result as the square-wave case,
+// not wrap or crash.
+void test_volume_level_true_full_scale_min(void) {
+    int16_t samples[64];
+    for (int i = 0; i < 64; i++) samples[i] = INT16_MIN;
+    uint8_t level = computeVolumeLevel(samples, 64);
+    TEST_ASSERT_TRUE(level >= 254);
 }
 
 // ----------------------------------------------------------------------------
@@ -308,6 +396,26 @@ void test_wav_wrap_zero_length_payload(void) {
     TEST_ASSERT_EQUAL_UINT32(0, dataSize);
 }
 
+// Exercises wavWrap() at the current realistic worst-case recording size
+// (MAX_RECORDING_SECONDS x SAMPLE_RATE_CAPTURE x 2 bytes = 5 x 16000 x 2 =
+// 160,000 bytes, per pins.h) rather than only ever at toy sizes -- mirrors
+// the same rationale as the base64 large-buffer tests above, which WAV
+// coverage hadn't gotten yet.
+void test_wav_wrap_realistic_max_size(void) {
+    static uint8_t pcm[160000];
+    for (size_t i = 0; i < sizeof(pcm); i++) pcm[i] = (uint8_t)(i * 13 + 5);
+
+    static uint8_t out[160000 + WAV_HEADER_SIZE];
+    size_t total = wavWrap(pcm, sizeof(pcm), out, sizeof(out));
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)(WAV_HEADER_SIZE + sizeof(pcm)), (uint32_t)total);
+
+    uint32_t dataSize;
+    memcpy(&dataSize, out + 40, 4);
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)sizeof(pcm), dataSize);
+
+    TEST_ASSERT_EQUAL_MEMORY(pcm, out + WAV_HEADER_SIZE, sizeof(pcm));
+}
+
 void test_wav_wrap_output_buffer_too_small(void) {
     uint8_t pcm[100] = {0};
     uint8_t out[50]; // needs WAV_HEADER_SIZE + 100 = 144
@@ -328,10 +436,13 @@ int main(int argc, char** argv) {
     RUN_TEST(test_base64_decode_stream_one_byte_at_a_time);
     RUN_TEST(test_base64_decode_stream_uneven_chunks);
     RUN_TEST(test_base64_decode_stream_large_buffer);
+    RUN_TEST(test_base64_decode_stream_output_buffer_too_small_does_not_corrupt_state);
+    RUN_TEST(test_base64_decode_malformed_unpadded_tail);
     RUN_TEST(test_base64_decode_ignores_whitespace);
 
     RUN_TEST(test_volume_level_silence_is_zero);
     RUN_TEST(test_volume_level_full_scale_square_wave_near_max);
+    RUN_TEST(test_volume_level_true_full_scale_min);
     RUN_TEST(test_volume_level_half_scale_constant);
     RUN_TEST(test_volume_level_empty_input_is_zero);
 
@@ -339,6 +450,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_wav_wrap_header_fields);
     RUN_TEST(test_wav_wrap_payload_preserved);
     RUN_TEST(test_wav_wrap_zero_length_payload);
+    RUN_TEST(test_wav_wrap_realistic_max_size);
     RUN_TEST(test_wav_wrap_output_buffer_too_small);
 
     return UNITY_END();

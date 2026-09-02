@@ -87,17 +87,36 @@ size_t base64DecodeStreamUpdate(Base64DecodeStream* state, const char* in, size_
         int8_t val = decodeChar(in[i]);
         if (val < 0) continue; // skip whitespace/newlines/padding defensively
 
-        // Shift in 6 new bits from this character.
-        state->bitBuffer = (state->bitBuffer << 6) | (uint32_t)val;
-        state->bits += 6;
+        // Shift in 6 new bits from this character, into locals rather than
+        // `state` directly -- see the capacity check below for why.
+        uint32_t nextBitBuffer = (state->bitBuffer << 6) | (uint32_t)val;
+        int nextBits = state->bits + 6;
 
         // Once we've accumulated a full byte (8 bits) worth, peel it off the
         // top of the buffer and emit it.
-        if (state->bits >= 8) {
-            state->bits -= 8;
-            if (outLen >= outCap) return 0; // caller's buffer too small
-            out[outLen++] = (uint8_t)((state->bitBuffer >> state->bits) & 0xFF);
+        if (nextBits >= 8) {
+            if (outLen >= outCap) {
+                // Caller's buffer is full. Stop here WITHOUT committing this
+                // character's bits to `state` (the contract is that `out`
+                // holds at least base64DecodedLen(inLen) bytes, so a
+                // well-behaved caller never actually reaches this -- but the
+                // old version updated `state` unconditionally before this
+                // check, so a caller that ever did violate the contract
+                // would lose the in-flight byte AND leave every future
+                // update() call on this stream permanently bit-misaligned,
+                // silently corrupting the rest of the decode instead of just
+                // this one chunk. Breaking here instead keeps `state` at
+                // exactly the last successfully-committed position, so
+                // decoding can pick back up correctly once the caller passes
+                // a large enough buffer.
+                break;
+            }
+            nextBits -= 8;
+            out[outLen++] = (uint8_t)((nextBitBuffer >> nextBits) & 0xFF);
         }
+
+        state->bitBuffer = nextBitBuffer;
+        state->bits = nextBits;
     }
 
     return outLen;

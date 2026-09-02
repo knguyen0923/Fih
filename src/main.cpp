@@ -8,18 +8,25 @@
 // device's actual behavior:
 //
 //   IDLE (Bluetooth speaker: phone streams music, motors react to it)
-//     -> (button pressed) -> RECORDING (stop Bluetooth, start connecting WiFi
-//        in the background while recording -- see loop())
-//     -> (button released) -> UPLOADING -> PROCESSING -> SYNTHESIZING
-//        (the existing Gemini push-to-talk flow, unchanged; motors now also
-//        react to the TTS reply's volume)
+//     -> (button pressed) -> RECORDING (mute Bluetooth output + stop the
+//        motors immediately -- cheap flag flips, see bluetoothMute() --
+//        then capture mic audio with zero delay)
+//     -> (button released) -> ENTERING VOICE MODE (now, only now, actually
+//        stop Bluetooth -- a real multi-second teardown -- and connect WiFi)
+//     -> UPLOADING -> PROCESSING -> SYNTHESIZING (the existing Gemini
+//        push-to-talk flow, unchanged; motors now also react to the TTS
+//        reply's volume)
 //     -> tear WiFi back down, resume Bluetooth speaker -> back to IDLE
 //
 // The reason for that radio dance: the ESP32 has one radio shared between
 // WiFi and Bluetooth Classic, and the two don't reliably run at once (see
 // enterVoiceMode()/exitVoiceMode() below) -- so Bluetooth is fully stopped
 // before every voice interaction and restarted after, rather than the two
-// ever being "on" at the same time.
+// ever being "on" at the same time. Fully stopping Bluetooth costs real
+// time (see bluetoothStop() in bluetooth.cpp), which is why it deliberately
+// happens *after* recording rather than before/during it -- doing it first
+// would delay the start of mic capture by that same amount, silently
+// losing the start of whatever the user says.
 //
 // Because the Gemini side of this makes blocking, sequential HTTPS calls (no
 // persistent connection, no background tasks), the UPLOADING/PROCESSING/
@@ -153,35 +160,48 @@ static void flashError() {
 }
 
 // Kicks off a WiFi connection attempt without blocking -- pairs with
-// waitForWiFi() below. Split into two functions specifically so loop() can
-// kick this off at button-press (overlapping with recording) and
-// enterVoiceMode() can wait for *that same* attempt afterward, rather than
-// starting a second one -- calling WiFi.begin() again while a connection is
-// already in progress can restart the handshake from scratch on this core,
-// which would defeat the point of starting it early.
+// waitForWiFi() below. Split into two functions so a caller can start the
+// connection and do other (brief) work before blocking on it, without ever
+// calling WiFi.begin() a second time on top of an attempt already in
+// progress -- doing that can restart the handshake from scratch on this
+// core, silently undoing whatever time was meant to be saved.
 static void beginWiFiConnect() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
-// Blocks until the connection kicked off by beginWiFiConnect() completes.
-// Does not call WiFi.begin() itself -- see that function's comment.
-static void waitForWiFi() {
+// Blocks until the connection kicked off by beginWiFiConnect() completes,
+// or WIFI_CONNECT_TIMEOUT_MS elapses. Returns true if connected. Does not
+// call WiFi.begin() itself -- see that function's comment.
+//
+// Bounded rather than infinite specifically because of what calls this now:
+// enterVoiceMode() reaches here only after bluetoothStop() has *fully*
+// released the radio (see bluetooth.cpp) -- if WiFi then never connected
+// and this blocked forever, the device would be stuck with neither radio
+// usable until a power cycle, unlike before Bluetooth existed here (a stuck
+// WiFi wait never used to cost anything else).
+static bool waitForWiFi() {
+    static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
     Serial.print("Connecting to WiFi");
+    unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - start > WIFI_CONNECT_TIMEOUT_MS) {
+            Serial.println(" timed out");
+            return false;
+        }
         delay(300);
         Serial.print(".");
     }
     Serial.print(" connected, IP ");
     Serial.println(WiFi.localIP());
+    return true;
 }
 
-// Connects to WiFi from a cold start and blocks until done -- used only by
-// WIFI_TEXT_TEST_MODE's one-shot boot-time test, where there's no earlier
-// beginWiFiConnect() call to wait on.
-static void connectWiFi() {
+// Connects to WiFi from a cold start and blocks until done (or timed out) --
+// used only by WIFI_TEXT_TEST_MODE's one-shot boot-time test.
+static bool connectWiFi() {
     beginWiFiConnect();
-    waitForWiFi();
+    return waitForWiFi();
 }
 
 // Passed to synthesizeSpeech() as its per-chunk callback: plays each decoded
@@ -200,29 +220,53 @@ static void playTtsChunk(const uint8_t* pcm, size_t len) {
     motorUpdateFromPcm(pcm, len);
 }
 
-// Finishes the radio switch loop() started at button-press (see loop()):
-// blocks until WiFi is connected (usually near-instant here, since the
-// connection was kicked off back when recording started), reconfigures I2S1
-// for a voice reply's sample rate, and stops the motors -- no audio plays
-// through the speaker during UPLOADING/PROCESSING, so nothing should be
-// driving them until synthesizeSpeech() starts calling playTtsChunk().
-static void enterVoiceMode() {
-    waitForWiFi(); // the connection was already kicked off at button-press, see loop()
+// Called once recording has finished (see loop()) to actually perform the
+// radio switch: fully stops Bluetooth (freeing the radio -- cheap muting
+// already happened at button-press, see bluetoothMute()'s comment for why
+// the expensive teardown has to wait until now), plays the "listening" tone,
+// starts connecting to WiFi, and reconfigures I2S1 for a voice reply's
+// sample rate once connected.
+//
+// Returns false if WiFi never connected (see waitForWiFi()) -- callers must
+// still call exitVoiceMode() in that case so Bluetooth resumes rather than
+// leaving the device with neither radio usable.
+static bool enterVoiceMode() {
+    bluetoothStop();
+    beginWiFiConnect(); // kick off immediately, non-blocking
+    audioPlayTone(SAMPLE_RATE_BLUETOOTH, TONE_ENTER_VOICE_HZ, TONE_DURATION_MS); // overlaps with the connection attempt starting
+    if (!waitForWiFi()) {
+        return false;
+    }
     audioSetPlaybackRate(SAMPLE_RATE_PLAYBACK);
-    motorStop();
+    return true;
 }
 
 // Reverses enterVoiceMode(): tears WiFi down and resumes Bluetooth speaker
-// mode. Used both after a normal interaction finishes and to undo the radio
-// switch if a button tap turned out to be too brief to record anything (see
-// loop()) -- in both cases, WiFi's job here is done and Bluetooth should
-// have the radio back.
+// mode. Called after a voice interaction finishes, successfully or not (see
+// loop()) -- a button tap too brief to record anything is a separate,
+// cheaper case (bluetoothUnmute(), not this) since Bluetooth was never
+// actually stopped for it in the first place.
+//
+// The tone is played *before* bluetoothStart(), not after -- bluetoothStart()
+// may reconnect quickly and start receiving audio on its own task
+// (onAudioData() in bluetooth.cpp), which would otherwise race with this
+// function's own i2s_write() calls (via audioPlayTone()) on the same I2S1
+// peripheral from the main task.
 static void exitVoiceMode() {
+    // A successful interaction leaves the motors at whatever speed
+    // playTtsChunk() last set them to (matching the TTS reply's final
+    // volume) -- nothing else zeroes them afterward. If the reconnected
+    // phone doesn't immediately resume streaming (paused, slow to notice
+    // the speaker again), onAudioData() won't fire to correct this either,
+    // so the motors would otherwise keep spinning at that stale level
+    // indefinitely. Stopping them here, before Bluetooth (and therefore
+    // fresh audio) can resume, closes that gap.
+    motorStop();
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     audioSetPlaybackRate(SAMPLE_RATE_BLUETOOTH);
-    bluetoothStart(); // proactively reconnects to the last-paired phone, see bluetooth.cpp
     audioPlayTone(SAMPLE_RATE_BLUETOOTH, TONE_EXIT_VOICE_HZ, TONE_DURATION_MS);
+    bluetoothStart(); // proactively reconnects to the last-paired phone, see bluetooth.cpp
 }
 
 // Runs the upload -> understand -> synthesize -> play sequence for one
@@ -324,13 +368,16 @@ void setup() {
     // speaker mode, since this test mode only validates WiFi/TLS/the API key
     // in isolation) and fire a trivial text query, printing whatever comes
     // back.
-    connectWiFi();
-    String reply;
-    if (textOnlyQuery("Say hello in five words or fewer.", reply)) {
-        Serial.print("Gemini replied: ");
-        Serial.println(reply);
+    if (!connectWiFi()) {
+        Serial.println("WIFI_TEXT_TEST_MODE: WiFi connect failed -- check WIFI_SSID/WIFI_PASSWORD in config.h");
     } else {
-        Serial.println("WIFI_TEXT_TEST_MODE query failed");
+        String reply;
+        if (textOnlyQuery("Say hello in five words or fewer.", reply)) {
+            Serial.print("Gemini replied: ");
+            Serial.println(reply);
+        } else {
+            Serial.println("WIFI_TEXT_TEST_MODE query failed");
+        }
     }
 #else
     // Normal operation: Bluetooth speaker is the default idle behavior --
@@ -377,16 +424,18 @@ void loop() {
     Serial.println("Recording...");
 
 #if !LOOPBACK_TEST_MODE
-    // Kick off the radio switch now, in parallel with recording below,
-    // instead of waiting until the button is released -- by the time
-    // recording ends, WiFi has often already finished connecting, hiding
-    // most of the switch latency (finished off by enterVoiceMode() below).
-    // bluetoothStop()'s full teardown isn't instant (see bluetooth.cpp) --
-    // the tone right after it turns that gap into a deliberate-feeling
-    // "listening now" cue instead of unexplained silence.
-    bluetoothStop();
-    audioPlayTone(SAMPLE_RATE_BLUETOOTH, TONE_ENTER_VOICE_HZ, TONE_DURATION_MS);
-    beginWiFiConnect();
+    // Mute Bluetooth output and stop the motors *immediately* -- both are
+    // cheap flag flips, unlike bluetoothStop()'s multi-second teardown
+    // (called later, in enterVoiceMode(), only once recording has
+    // finished). Doing the expensive teardown here instead would delay the
+    // start of mic capture below by that same multi-second amount, silently
+    // losing the start of whatever the user says -- I2S0's DMA buffer only
+    // holds ~64ms of audio, so anything said during that delay would
+    // already be overwritten by the time audioReadChunk() first runs.
+    // Muting first also keeps any currently-playing Bluetooth music from
+    // bleeding into the recording while the user talks.
+    bluetoothMute();
+    motorStop();
 #endif
 
     size_t recorded = 0;
@@ -401,9 +450,11 @@ void loop() {
 
     if (recorded == 0) {
         // Button was tapped so briefly nothing was actually captured -- no
-        // interaction will run, so undo the radio switch started above.
+        // interaction will run. Bluetooth was only muted, never actually
+        // stopped (see above), so just unmute rather than paying for a full
+        // bluetoothStop()/bluetoothStart() cycle for nothing.
 #if !LOOPBACK_TEST_MODE
-        exitVoiceMode();
+        bluetoothUnmute();
 #endif
         state = IDLE;
         return;
@@ -422,11 +473,17 @@ void loop() {
     audioSetPlaybackRate(SAMPLE_RATE_BLUETOOTH);
     state = IDLE;
 #else
-    // Normal operation: finish the radio switch, run the full record ->
-    // understand -> speak -> play pipeline for what was just captured, then
-    // switch back to being a Bluetooth speaker.
-    enterVoiceMode();
-    processInteraction(recorded);
+    // Normal operation: perform the radio switch (bluetoothStop() -> WiFi),
+    // run the full record -> understand -> speak -> play pipeline for what
+    // was just captured, then switch back to being a Bluetooth speaker --
+    // regardless of whether the interaction itself succeeded, so a failed
+    // WiFi connect never leaves the device with neither radio usable.
+    if (enterVoiceMode()) {
+        processInteraction(recorded);
+    } else {
+        Serial.println("WiFi connect failed -- aborting this interaction");
+        flashError();
+    }
     exitVoiceMode();
     state = IDLE;
 #endif

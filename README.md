@@ -90,9 +90,12 @@ Firmware state machine (see `src/main.cpp`):
 
 ```
 IDLE (Bluetooth speaker: phone streams music, motors react to it)
-  → (button press) → RECORDING (Bluetooth stops; WiFi connect kicked off in
-     the background; I2S capture into RAM buffer)
-  → (button release) → UPLOADING (streamed base64 encode + HTTPS POST #1 — audio understanding)
+  → (button press) → RECORDING (Bluetooth output muted + motors stopped --
+     instant flag flips, not a real teardown -- then I2S capture into RAM
+     buffer starts immediately)
+  → (button release) → ENTERING VOICE MODE (only now does Bluetooth actually
+     stop -- a real multi-second teardown -- then WiFi connects)
+  → UPLOADING (streamed base64 encode + HTTPS POST #1 — audio understanding)
   → PROCESSING (await text response)
   → SYNTHESIZING (HTTPS POST #2 — text-to-speech, decoded and played back per
      chunk as it streams in; motors react to it too)
@@ -129,42 +132,69 @@ Classic (the profile A2DP — Bluetooth audio streaming — needs). In practice,
 the two don't reliably run at once: A2DP's constant audio streaming leaves
 little room for WiFi, and vice versa ([confirmed via research](https://github.com/pschatzmann/ESP32-A2DP/wiki/WIFI-and-A2DP-Coexistence)).
 Rather than fight that, this firmware switches between the two radio modes
-instead of running them simultaneously:
+instead of running them simultaneously — in two stages, not one, because the
+full switch itself costs real time and can't be allowed to delay the start
+of mic capture:
 
 - **Idle = Bluetooth speaker.** `bluetoothStart()` (`src/bluetooth.cpp`) is
   the default state coming out of `setup()`.
-- **Button press → full radio switch.** `bluetoothStop()` disconnects and
-  fully disables the Bluetooth controller (`a2dp_sink.end(true)` — confirmed
-  by reading the `ESP32-A2DP` library's own source that the default,
-  `end()`/`end(false)`, does *not* actually release the controller, which
-  would defeat the point), then `WiFi.begin()` is kicked off immediately, in
-  parallel with the recording that follows — so by the time the button is
-  released, WiFi has often already finished connecting, hiding most of the
-  switch latency (`loop()` in `main.cpp`).
-- **After the Gemini interaction (or if the button tap was too brief to
-  record anything), `exitVoiceMode()` tears WiFi back down and restarts
-  Bluetooth** — proactively reconnecting to the phone it was just talking to
-  (`connect_to()`, using an address this project saves itself, since
-  `end()` always wipes the library's own "last connection" memory as part
-  of its shutdown) rather than passively waiting for the phone to notice
-  the speaker again.
-- **Short tone cues** (`audioPlayTone()` in `audio.cpp`) mark both
-  transitions — a full Bluetooth teardown isn't instant (the library's own
-  shutdown sequence takes real time), so an otherwise-silent multi-second
-  gap is made to read as an intentional "listening now" / "back to being a
-  speaker" moment instead of the device seeming to have hung.
+- **Button press → mute immediately, don't stop yet.** `bluetoothMute()` and
+  `motorStop()` are cheap flag flips (`src/bluetooth.cpp`/`src/motor.cpp`),
+  not a real teardown — they run *before* mic capture starts specifically so
+  capture can begin with zero delay. The actual Bluetooth teardown
+  (`a2dp_sink.end(true)`, confirmed by reading the library's source to take
+  real time) happens only *after* recording finishes, in `enterVoiceMode()`
+  — doing it before/during recording would delay `audioReadChunk()` by that
+  same amount, silently losing the start of whatever the user says (I2S0's
+  DMA buffer only holds ~64ms of audio). Muting first also keeps any
+  currently-playing Bluetooth music from bleeding into the mic while the
+  user talks.
+- **Button release → the real switch.** `enterVoiceMode()` calls
+  `bluetoothStop()` (`a2dp_sink.end(true)` — confirmed by reading the
+  library's source that the default, `end()`/`end(false)`, does *not*
+  actually release the controller, which would defeat the point), starts
+  connecting to WiFi, and waits (with a 15-second timeout — see below) before
+  reconfiguring I2S1 for the Gemini reply.
+- **After the interaction (or if the button tap was too brief to record
+  anything), Bluetooth resumes.** `exitVoiceMode()` tears WiFi back down and
+  calls `bluetoothStart()`, proactively reconnecting to the phone it was just
+  talking to (`connect_to()`, using an address this project saves itself,
+  since `end()` always wipes the library's own "last connection" memory as
+  part of its shutdown) rather than passively waiting for the phone to
+  notice the speaker again. A brief tap that captured nothing skips the full
+  stop/restart cycle entirely — `bluetoothUnmute()` alone is enough, since
+  Bluetooth was never actually stopped for it.
+- **If WiFi never connects** (`waitForWiFi()`, `src/main.cpp`), the wait
+  times out after 15 seconds rather than blocking forever — Bluetooth has
+  already been fully released by this point, so an unbounded wait here would
+  leave the device with *neither* radio usable until a power cycle. On
+  timeout, the interaction is abandoned (LED error flash) and Bluetooth
+  resumes normally.
+- **Short tone cues** (`audioPlayTone()` in `audio.cpp`) mark both real
+  transitions — a full Bluetooth teardown isn't instant, so an otherwise-
+  silent multi-second gap is made to read as an intentional "listening now" /
+  "back to being a speaker" moment instead of the device seeming to have
+  hung. The exit tone plays *before* `bluetoothStart()`, not after, since
+  `bluetoothStart()`'s reconnect can start receiving audio on its own task
+  almost immediately — playing the tone first avoids two tasks writing to
+  I2S1 at once.
 
 The real cost of this design is a noticeable delay (expect roughly 1-3
 seconds, hardware-dependent) between releasing the button and the recording
 actually starting to upload, on top of Gemini's own response time — this
 hasn't been measured on real hardware yet (see
-[Things to spot-check](#things-to-spot-check-once-you-have-hardware)). The
-tone cues and proactive reconnect are meant to make that gap feel
-deliberate rather than eliminate it — true audio "ducking" (music kept
-playing, just quieter, while Gemini works) was considered and rejected: it
-would require Bluetooth to keep actively streaming audio at the same time
-WiFi is live, which is the one scenario the coexistence research above
-found genuinely unreliable, not just slow.
+[Things to spot-check](#things-to-spot-check-once-you-have-hardware)). An
+earlier version of this design tried to hide that delay by starting the
+WiFi connection *during* recording instead of after — that turned out to be
+unsafe (it required starting the Bluetooth teardown before recording too,
+which silently truncated the start of every recording), so the delay is now
+fully after button-release rather than partially hidden, in exchange for not
+losing what's said. The tone cues and proactive reconnect are meant to make
+that gap feel deliberate rather than eliminate it — true audio "ducking"
+(music kept playing, just quieter, while Gemini works) was considered and
+rejected: it would require Bluetooth to keep actively streaming audio at the
+same time WiFi is live, which is the one scenario the coexistence research
+above found genuinely unreliable, not just slow.
 
 ## Hardware
 
@@ -477,10 +507,19 @@ because they can drift as Google's API evolves:
 - **Amp channel-select wiring** — whichever pin (`SD`/`GAIN`) picks left vs.
   right on each MAX98357A board; get this backwards and stereo audio plays
   in the wrong channel or a channel plays silent. See [Wiring](#wiring).
-- **Bluetooth/WiFi radio-switch timing** — how long the switch actually takes
-  in practice, and whether starting `WiFi.begin()` at the start of recording
-  (rather than after button release) meaningfully hides that latency, hasn't
-  been measured on real hardware.
+- **Bluetooth/WiFi radio-switch timing** — how long `bluetoothStop()`'s full
+  teardown and the subsequent WiFi connect actually take together in
+  practice (both now happen after button-release, not overlapped with
+  recording — see [How Bluetooth and WiFi share one radio](#how-bluetooth-and-wifi-share-one-radio))
+  hasn't been measured on real hardware.
+- **`bluetoothMute()`/`bluetoothUnmute()`** — confirmed to compile and, by
+  inspection, to skip `onAudioData()`'s work when muted, but whether muting
+  is fast/clean enough in practice to avoid an audible glitch right at
+  button-press (vs. a hard stop) hasn't been heard on real speakers.
+- **The 15-second WiFi connect timeout** (`waitForWiFi()` in `main.cpp`) —
+  long enough for a normal home network, but not validated against how long
+  this board's WiFi actually takes to associate in practice; adjust if it
+  ever times out on a network that would have connected given more time.
 - **Proactive Bluetooth reconnect** — `bluetooth.cpp`'s `connect_to()` call
   (using a peer address this project saves itself before tearing Bluetooth
   down) is confirmed to compile against the real library, but whether it
@@ -554,8 +593,14 @@ because they can drift as Google's API evolves:
 - [ ] Motors visibly react to both Bluetooth music and Gemini TTS reply volume
 - [ ] A button press cleanly stops Bluetooth, completes a voice interaction,
       and Bluetooth resumes afterward — repeatedly, not just once
-- [ ] The WiFi-connect-during-recording overlap actually reduces perceived
-      latency vs. connecting only after button release
+- [ ] Speaking immediately after pressing the button isn't clipped/lost --
+      confirms muting (not the full Bluetooth stop) is really what's
+      guarding the start of mic capture
+- [ ] A recording made while Bluetooth music was playing doesn't audibly
+      pick up that music in the background
+- [ ] Unplugging the router (or otherwise blocking WiFi) mid-interaction
+      results in an error flash + Bluetooth resuming within ~15 seconds, not
+      a permanent hang
 - [ ] After a voice interaction, the phone reconnects to Bluetooth promptly
       (proactive `connect_to()` working as intended, not just falling back to
       the phone noticing on its own)

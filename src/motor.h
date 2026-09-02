@@ -24,7 +24,10 @@ void motorInit();
 // works the same whether it's mono (TTS) or stereo (Bluetooth music).
 void motorUpdateFromPcm(const uint8_t* pcm, size_t len);
 
-// Zeroes both motors' PWM duty. Called at boot and whenever entering voice
-// mode (no audio plays through the speaker during the Gemini upload/process
-// steps, so nothing should be driving the motors then).
+// Zeroes both motors' PWM duty. Called at boot (via motorInit()), at
+// button-press before recording starts (no audio plays through the speaker
+// during the Gemini upload/process/synthesize steps, so nothing should be
+// driving the motors then), and again in exitVoiceMode() before Bluetooth
+// resumes (so a TTS reply's last volume doesn't linger as a stale motor
+// speed -- see that function's comment in main.cpp).
 void motorStop();
