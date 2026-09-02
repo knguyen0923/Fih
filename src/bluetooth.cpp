@@ -37,6 +37,24 @@ static volatile bool muted = false;
 static void onAudioData(const uint8_t* data, uint32_t len) {
     if (muted) return;
     audioPlayFromBuffer(data, len);
+    // Re-checked here, not just at entry: audioPlayFromBuffer() above is a
+    // blocking I2S write that can take a few ms, long enough for
+    // bluetoothMute()+motorStop() to run on the main task in between (see
+    // main.cpp's loop(), button-press handling). Without this second check,
+    // this call could still write a stale nonzero motor speed *after*
+    // motorStop() already zeroed it -- and since muting (unlike stopping)
+    // suppresses every future onAudioData() call too, nothing would ever
+    // correct that stale value for the rest of the interaction, reproducing
+    // the exact "motors keep spinning through RECORDING" bug the
+    // mute/stop split was built to fix in the first place. This doesn't
+    // fully close the race (there's still a much smaller window between
+    // this check and motorUpdateFromPcm()'s ledcWrite() calls below) --
+    // doing that properly would need a lock shared with bluetoothMute(),
+    // which isn't safe to hold across the blocking I2S write above (it would
+    // stall the whole system, not just this task) -- but it shrinks the
+    // exposed window from "a several-ms I2S write" down to a few
+    // instructions, which is the cheap fix that's actually safe to make here.
+    if (muted) return;
     motorUpdateFromPcm(data, len);
 }
 

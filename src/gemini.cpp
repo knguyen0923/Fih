@@ -319,30 +319,85 @@ static bool feedBase64UntilQuote(Base64DecodeStream* decodeState, const char* da
 }
 
 // How long streamTtsResponse() will wait, in total, for Gemini to finish
-// sending the TTS reply body before giving up. Each individual read below is
-// already bounded by the underlying WiFiClientSecure's own read timeout
-// (Stream::readBytes()/readStringUntil() give up and return after that many
-// ms with whatever they've got, ~30s by default) -- but that alone doesn't
-// cap how long a series of many small-but-nonzero reads can keep the loops
-// below spinning for if the server just trickles data slowly. This is the
-// actual wall-clock ceiling, matching the spirit of waitForWiFi()'s 15s
-// timeout in main.cpp (added for the same reason: an unbounded wait here
-// would hang the device indefinitely with no error, no LED change, and no
-// recovery short of a power cycle).
+// sending the TTS reply body before giving up -- measured as elapsed time
+// since the call started (millis() - callStart, the same overflow-safe
+// pattern waitForWiFi() in main.cpp uses, correct even across millis()'s
+// ~49-day wraparound). Deliberately NOT enforced via WiFiClientSecure's own
+// per-character read timeout (30s by default, see Stream::timedRead()):
+// that timeout resets on every single byte, so it can't express "give up
+// after 20s total" -- only readWithDeadline() below, by polling
+// stream.available() itself instead of trusting a blocking library read to
+// return in time, can actually make this deadline hold for a single call
+// the way it's meant to.
 static const unsigned long TTS_STREAM_TIMEOUT_MS = 20000;
+
+// Reads up to `len` bytes into `out` from `stream`, waiting only while less
+// than TTS_STREAM_TIMEOUT_MS has elapsed since `callStart`. Only reads bytes
+// already confirmed present via stream.available() -- never calls
+// Stream::readBytes()/timedRead() while nothing is available -- so a single
+// call can't itself block for anywhere near as long as the stream's own
+// internal timeout could stall for; that's what makes the deadline actually
+// enforceable per-call rather than merely best-effort between calls (a real
+// bug in an earlier version of this code). Returns the number of bytes
+// read; 0 means the deadline passed or the connection dropped before
+// anything arrived.
+static size_t readWithDeadline(WiFiClient& stream, uint8_t* out, size_t len, unsigned long callStart) {
+    while (millis() - callStart < TTS_STREAM_TIMEOUT_MS) {
+        size_t avail = stream.available();
+        if (avail > 0) {
+            return stream.readBytes(out, min(avail, len));
+        }
+        if (!stream.connected()) return 0;
+        delay(2); // brief yield while waiting for more bytes, not a busy-spin
+    }
+    return 0;
+}
+
+// Reads one HTTP chunk-size line ("<hex digits>[;ext]\r\n", per RFC 7230)
+// from `stream`, one byte at a time via readWithDeadline(). Byte-at-a-time
+// is deliberate: the previous version of this used
+// Stream::readStringUntil('\n'), which internally retries a per-character
+// timedRead() and gives up returning whatever's accumulated so far either
+// when '\n' arrives OR when that per-character wait times out -- the two
+// cases are indistinguishable from the caller's side. A chunk-size line
+// split across a slow TLS read could therefore get misread as a shorter,
+// wrong size instead of correctly waiting for the rest of it. Reading (and
+// checking for '\n') one byte at a time removes that ambiguity entirely.
+// Returns the parsed chunk size, or -1 if the deadline passed, the
+// connection dropped, or the line was implausibly long for a real chunk-size
+// line (protocol violation -- bail rather than let it overflow `buf`).
+static int32_t readChunkSizeLine(WiFiClient& stream, unsigned long callStart) {
+    char buf[16];
+    size_t len = 0;
+    while (true) {
+        uint8_t c;
+        if (readWithDeadline(stream, &c, 1, callStart) != 1) return -1;
+        if (c == '\n') break;
+        if (c == '\r') continue; // drop CR, keep waiting for LF
+        if (len >= sizeof(buf) - 1) return -1;
+        buf[len++] = (char)c;
+    }
+    buf[len] = '\0';
+    // Chunk extensions ("<size>;ext=value") aren't sent by anything this
+    // firmware talks to, but strtol() naturally stops at the first
+    // non-hex-digit character (';' included), so they're harmless if ever present.
+    return (int32_t)strtol(buf, nullptr, 16);
+}
 
 // Tracks state for stripping HTTP chunked-transfer-encoding framing
 // ("<hex-size>\r\n<data>\r\n", repeated, ended by a zero-size chunk) off a
 // raw response stream. HTTPClient::getStream() hands back the transport
 // socket completely unprocessed -- only HTTPClient's own writeToStream()/
-// getString() do dechunking internally, and neither fits this function's
-// need to interleave a wall-clock deadline check between reads (see
-// TTS_STREAM_TIMEOUT_MS) -- so this reimplements just enough of it by hand.
-// Left unstripped, chunk-size hex digits and CRLF framing would get scanned
-// as if they were response bytes: at best that desyncs the "data" needle
-// search below, and at worst -- since hex digits are themselves valid base64
-// characters -- any that land inside the audio payload get silently decoded
-// as bogus PCM instead of being recognized as framing, corrupting playback.
+// getString() do dechunking internally, and neither is used here: both make
+// a single library-internal blocking call per chunk with no way to
+// interleave a deadline check partway through, which would silently bring
+// back the exact "can't actually enforce TTS_STREAM_TIMEOUT_MS" problem
+// readWithDeadline() above exists to avoid. Left unstripped, chunk-size hex
+// digits and CRLF framing would get scanned as if they were response bytes:
+// at best that desyncs the "data" needle search below, and at worst --
+// since hex digits are themselves valid base64 characters -- any that land
+// inside the audio payload get silently decoded as bogus PCM instead of
+// being recognized as framing, corrupting playback.
 struct ChunkedReadState {
     bool chunked;
     uint32_t chunkRemaining;
@@ -350,32 +405,38 @@ struct ChunkedReadState {
 };
 
 // Reads up to `len` bytes of actual response payload from `stream` into
-// `out`, transparently stripping chunk framing when `state->chunked` is set.
-// Returns 0 if nothing was available within this call's own read timeout
-// (the caller's surrounding loop decides whether to retry or give up -- see
-// the deadline/connected() checks around each call site below), or once a
-// chunked body's terminating zero-size chunk has been seen.
-static size_t readDechunked(WiFiClient& stream, ChunkedReadState* state, uint8_t* out, size_t len) {
+// `out`, transparently stripping chunk framing when `state->chunked` is
+// set, with every read bounded by TTS_STREAM_TIMEOUT_MS (via
+// readWithDeadline()/readChunkSizeLine() above). Returns 0 if the deadline
+// passed, the connection dropped, or a chunked body's terminating
+// zero-size chunk has been seen (state->ended is then left true so the
+// caller can tell "give up" apart from "try again").
+static size_t readDechunked(WiFiClient& stream, ChunkedReadState* state, uint8_t* out, size_t len, unsigned long callStart) {
     if (!state->chunked) {
-        return stream.readBytes(out, len);
+        return readWithDeadline(stream, out, len, callStart);
     }
     if (state->ended) return 0;
     if (state->chunkRemaining == 0) {
-        String line = stream.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0) return 0; // chunk-size line hasn't fully arrived yet
-        state->chunkRemaining = (uint32_t)strtol(line.c_str(), nullptr, 16);
+        int32_t size = readChunkSizeLine(stream, callStart);
+        if (size < 0) return 0; // timed out, disconnected, or a malformed line -- caller's outer loop decides what to do
+        state->chunkRemaining = (uint32_t)size;
         if (state->chunkRemaining == 0) {
             state->ended = true;
             return 0;
         }
     }
     size_t want = min((size_t)state->chunkRemaining, len);
-    size_t n = stream.readBytes(out, want);
+    size_t n = readWithDeadline(stream, out, want, callStart);
     state->chunkRemaining -= n;
     if (n > 0 && state->chunkRemaining == 0) {
-        char crlf[2];
-        stream.readBytes((uint8_t*)crlf, 2); // trailing CRLF after each chunk's data
+        // Trailing CRLF after this chunk's data -- read one byte at a time
+        // (the previous version used a single readBytes(...,2) call and
+        // never checked whether it actually got both bytes) so a short or
+        // slow arrival can't leave a stray '\r'/'\n' for the next
+        // chunk-size line parse to trip over.
+        uint8_t discard;
+        readWithDeadline(stream, &discard, 1, callStart);
+        readWithDeadline(stream, &discard, 1, callStart);
     }
     return n;
 }
@@ -406,17 +467,23 @@ static bool streamTtsResponse(HTTPClient& https, void (*onPcmChunk)(const uint8_
     static const size_t DATA_NEEDLE_LEN = 8;
 
     uint8_t readBuf[512];
-    unsigned long deadline = millis() + TTS_STREAM_TIMEOUT_MS;
+    unsigned long callStart = millis();
 
     while (headLen < HEAD_CAP && dataStart < 0) {
-        if (millis() > deadline) {
+        if (millis() - callStart > TTS_STREAM_TIMEOUT_MS) {
             Serial.println("TTS response: timed out waiting for \"data\" field");
             return false;
         }
         size_t want = min(sizeof(readBuf), HEAD_CAP - headLen);
-        size_t n = readDechunked(stream, &chunkState, readBuf, want);
+        size_t n = readDechunked(stream, &chunkState, readBuf, want, callStart);
         if (n == 0) {
-            if (!stream.connected() && !stream.available()) break;
+            // chunkState.ended means the body is over (chunked body's final
+            // zero-size chunk already seen) -- without this check, a
+            // chunked response that ends before ever containing "data"
+            // would sit here retrying (stream.connected() can stay true on
+            // a kept-alive connection) until the deadline above, instead of
+            // failing immediately once it's clear there's nothing more to read.
+            if ((!stream.connected() && !stream.available()) || chunkState.ended) break;
             continue;
         }
         memcpy(head + headLen, readBuf, n);
@@ -452,11 +519,11 @@ static bool streamTtsResponse(HTTPClient& https, void (*onPcmChunk)(const uint8_
     }
 
     while (stream.connected() || stream.available()) {
-        if (millis() > deadline) {
+        if (millis() - callStart > TTS_STREAM_TIMEOUT_MS) {
             Serial.println("TTS response: timed out mid-stream");
             return false;
         }
-        size_t n = readDechunked(stream, &chunkState, readBuf, sizeof(readBuf));
+        size_t n = readDechunked(stream, &chunkState, readBuf, sizeof(readBuf), callStart);
         if (n == 0) {
             if (!stream.connected() || chunkState.ended) break;
             continue;
