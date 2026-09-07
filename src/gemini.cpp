@@ -323,7 +323,9 @@ static bool feedBase64UntilQuote(Base64DecodeStream* decodeState, const char* da
 // since the call started (millis() - callStart, the same overflow-safe
 // pattern waitForWiFi() in main.cpp uses, correct even across millis()'s
 // ~49-day wraparound). Deliberately NOT enforced via WiFiClientSecure's own
-// per-character read timeout (30s by default, see Stream::timedRead()):
+// per-character read timeout (~5s, per HTTPClient's own TCP-timeout setting
+// -- not the 30s Stream::setTimeout() default, which HTTPClient overrides;
+// see Stream::timedRead()):
 // that timeout resets on every single byte, so it can't express "give up
 // after 20s total" -- only readWithDeadline() below, by polling
 // stream.available() itself instead of trusting a blocking library read to
@@ -343,11 +345,17 @@ static const unsigned long TTS_STREAM_TIMEOUT_MS = 20000;
 // anything arrived.
 static size_t readWithDeadline(WiFiClient& stream, uint8_t* out, size_t len, unsigned long callStart) {
     while (millis() - callStart < TTS_STREAM_TIMEOUT_MS) {
-        size_t avail = stream.available();
+        // available() returns int and is negative on a TLS error/close_notify
+        // (confirmed against WiFiClientSecure's data_to_read()) -- comparing
+        // as int first, before ever handing the value to readBytes()/min(),
+        // is required so a negative reading can't wrap into a huge size_t
+        // and defeat the whole point of this function (never calling
+        // readBytes() while nothing is actually available).
+        int avail = stream.available();
         if (avail > 0) {
-            return stream.readBytes(out, min(avail, len));
+            return stream.readBytes(out, min((size_t)avail, len));
         }
-        if (!stream.connected()) return 0;
+        if (avail < 0 || !stream.connected()) return 0;
         delay(2); // brief yield while waiting for more bytes, not a busy-spin
     }
     return 0;
@@ -430,10 +438,15 @@ static size_t readDechunked(WiFiClient& stream, ChunkedReadState* state, uint8_t
     state->chunkRemaining -= n;
     if (n > 0 && state->chunkRemaining == 0) {
         // Trailing CRLF after this chunk's data -- read one byte at a time
-        // (the previous version used a single readBytes(...,2) call and
-        // never checked whether it actually got both bytes) so a short or
-        // slow arrival can't leave a stray '\r'/'\n' for the next
-        // chunk-size line parse to trip over.
+        // (the previous version used a single readBytes(...,2) call, which
+        // blocks internally with no deadline of its own) instead of one
+        // blocking 2-byte read. Each call's own return value is discarded:
+        // if the deadline or a disconnect cuts a read short here, the next
+        // readChunkSizeLine() call shares the same callStart, so it will
+        // itself immediately return -1 (deadline already passed, or
+        // stream.connected() now false) rather than misparsing a stray
+        // '\r'/'\n' as part of a chunk-size line -- the caller's outer loop
+        // then correctly treats that as "give up", not silent corruption.
         uint8_t discard;
         readWithDeadline(stream, &discard, 1, callStart);
         readWithDeadline(stream, &discard, 1, callStart);
