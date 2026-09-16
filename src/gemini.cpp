@@ -61,22 +61,58 @@ static bool extractJsonStringField(const String& json, const char* key, String& 
 // upload uses postStreamed() below instead, and synthesizeSpeech()'s much
 // larger audio response is read incrementally via its own HTTPClient call --
 // see streamTtsResponse()).
+// Builds the request URL for a given model -- every call site hits the same
+// generateContent endpoint, differing only by which model name goes in.
+static String geminiUrl(const char* model) {
+    return String(GEMINI_HOST) + model + ":generateContent";
+}
+
+// Opens a TLS connection and attaches the headers every Gemini request needs
+// (content type + API key). Shared by postJson(), postStreamed(), and
+// synthesizeSpeech()'s own request loop -- factored out since it's identical
+// across all three (unlike the send/response handling just after it, which
+// differs enough between a String body, a streamed Stream body, and a
+// response that has to stay open for streaming that forcing those into one
+// shared function would need more indirection than it'd save). `client` and
+// `https` are caller-owned (not returned by value) since `https.begin()`
+// keeps a reference to `client` that must outlive it.
+static bool beginGeminiRequest(WiFiClientSecure& client, HTTPClient& https, const String& url) {
+    // setInsecure() skips TLS certificate validation entirely. This is a
+    // deliberate simplicity tradeoff acceptable for a personal device (see
+    // the security notes in the README) -- swap in a pinned Google root CA
+    // here instead if you want stricter validation.
+    client.setInsecure();
+    if (!https.begin(client, url)) return false;
+    https.addHeader("Content-Type", "application/json");
+    // The API key travels as a request header rather than a URL query
+    // parameter -- both are accepted by Gemini's API, but the header form
+    // keeps the key out of any request logging that only captures URLs.
+    https.addHeader("x-goog-api-key", GEMINI_API_KEY);
+    return true;
+}
+
+// Common handling for whatever an attempt's HTTP response code was, shared by
+// postJson(), postStreamed(), and synthesizeSpeech(). Assumes the caller
+// already handled `code == 200` itself (that's the one case whose next step
+// differs per caller: a String response, vs. a stream handed to
+// streamTtsResponse()) and already called https.end() before this runs.
+// Returns true if the caller should retry (this function has already
+// delayed accordingly) -- false means give up (this function has already
+// logged why).
+static bool shouldRetryGeminiRequest(int code, int attempt) {
+    if (code == 429 && attempt == 0) {
+        delay(RETRY_DELAY_MS);
+        return true; // caller loops to its second and final attempt
+    }
+    Serial.printf("Gemini request failed, HTTP %d\n", code);
+    return false;
+}
+
 static bool postJson(const String& url, const String& body, String& responseOut) {
     for (int attempt = 0; attempt < 2; attempt++) {
         WiFiClientSecure client;
-        // setInsecure() skips TLS certificate validation entirely. This is a
-        // deliberate simplicity tradeoff acceptable for a personal device (see
-        // the security notes in the README) -- swap in a pinned Google root CA
-        // here instead if you want stricter validation.
-        client.setInsecure();
-
         HTTPClient https;
-        if (!https.begin(client, url)) return false;
-        https.addHeader("Content-Type", "application/json");
-        // The API key travels as a request header rather than a URL query
-        // parameter -- both are accepted by Gemini's API, but the header form
-        // keeps the key out of any request logging that only captures URLs.
-        https.addHeader("x-goog-api-key", GEMINI_API_KEY);
+        if (!beginGeminiRequest(client, https, url)) return false;
 
         int code = https.POST((uint8_t*)body.c_str(), body.length());
         if (code == 200) {
@@ -86,12 +122,7 @@ static bool postJson(const String& url, const String& body, String& responseOut)
         }
         https.end();
 
-        if (code == 429 && attempt == 0) {
-            delay(RETRY_DELAY_MS);
-            continue; // second and final attempt
-        }
-        Serial.printf("Gemini request failed, HTTP %d\n", code);
-        return false;
+        if (!shouldRetryGeminiRequest(code, attempt)) return false;
     }
     return false;
 }
@@ -199,12 +230,8 @@ private:
 static bool postStreamed(const String& url, Base64AudioBodyStream& body, String& responseOut) {
     for (int attempt = 0; attempt < 2; attempt++) {
         WiFiClientSecure client;
-        client.setInsecure();
-
         HTTPClient https;
-        if (!https.begin(client, url)) return false;
-        https.addHeader("Content-Type", "application/json");
-        https.addHeader("x-goog-api-key", GEMINI_API_KEY);
+        if (!beginGeminiRequest(client, https, url)) return false;
 
         int code = https.sendRequest("POST", &body, body.totalLength());
         if (code == 200) {
@@ -214,15 +241,31 @@ static bool postStreamed(const String& url, Base64AudioBodyStream& body, String&
         }
         https.end();
 
-        if (code == 429 && attempt == 0) {
-            delay(RETRY_DELAY_MS);
-            body.reset();
-            continue; // second and final attempt
-        }
-        Serial.printf("Gemini request failed, HTTP %d\n", code);
-        return false;
+        if (!shouldRetryGeminiRequest(code, attempt)) return false;
+        body.reset(); // rewind the stream -- the first attempt consumed it
     }
     return false;
+}
+
+// Pulls the reply text out of a generateContent JSON response, shared by
+// understandSpeech() and textOnlyQuery() -- both hit the same text-model
+// endpoint and get back the identical response shape:
+//   { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
+// A full ArduinoJson parse (rather than a manual string search) is cheap
+// here since the response is small (bounded by GEMINI_MAX_OUTPUT_TOKENS),
+// and gets correct handling of any escaped characters in Gemini's
+// natural-language reply (quotes, newlines, unicode, etc.).
+static bool extractGeminiReplyText(const String& response, String& replyTextOut) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, response);
+    if (err) {
+        Serial.printf("Failed to parse Gemini response: %s\n", err.c_str());
+        return false;
+    }
+    const char* text = doc["candidates"][0]["content"]["parts"][0]["text"];
+    if (!text) return false;
+    replyTextOut = text;
+    return true;
 }
 
 bool understandSpeech(const uint8_t* wavData, size_t wavLen, String& replyTextOut) {
@@ -244,27 +287,9 @@ bool understandSpeech(const uint8_t* wavData, size_t wavLen, String& replyTextOu
 
     Base64AudioBodyStream body(prefix.c_str(), prefix.length(), wavData, wavLen, suffix.c_str(), suffix.length());
 
-    String url = String(GEMINI_HOST) + GEMINI_TEXT_MODEL + ":generateContent";
     String response;
-    bool ok = postStreamed(url, body, response);
-    if (!ok) return false;
-
-    // The response is small (bounded by GEMINI_MAX_OUTPUT_TOKENS), so a full
-    // ArduinoJson parse here is cheap and gets us correct handling of any
-    // escaped characters in Gemini's natural-language reply (quotes,
-    // newlines, unicode, etc.) that a manual string search would get wrong.
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, response);
-    if (err) {
-        Serial.printf("Failed to parse Gemini response: %s\n", err.c_str());
-        return false;
-    }
-
-    // Response shape: { "candidates": [ { "content": { "parts": [ { "text": "..." } ] } } ] }
-    const char* text = doc["candidates"][0]["content"]["parts"][0]["text"];
-    if (!text) return false;
-    replyTextOut = text;
-    return true;
+    if (!postStreamed(geminiUrl(GEMINI_TEXT_MODEL), body, response)) return false;
+    return extractGeminiReplyText(response, replyTextOut);
 }
 
 bool textOnlyQuery(const String& prompt, String& replyTextOut) {
@@ -282,21 +307,9 @@ bool textOnlyQuery(const String& prompt, String& replyTextOut) {
     String body;
     serializeJson(doc, body);
 
-    String url = String(GEMINI_HOST) + GEMINI_TEXT_MODEL + ":generateContent";
     String response;
-    if (!postJson(url, body, response)) return false;
-
-    JsonDocument respDoc;
-    DeserializationError err = deserializeJson(respDoc, response);
-    if (err) {
-        Serial.printf("Failed to parse Gemini response: %s\n", err.c_str());
-        return false;
-    }
-
-    const char* text = respDoc["candidates"][0]["content"]["parts"][0]["text"];
-    if (!text) return false;
-    replyTextOut = text;
-    return true;
+    if (!postJson(geminiUrl(GEMINI_TEXT_MODEL), body, response)) return false;
+    return extractGeminiReplyText(response, replyTextOut);
 }
 
 // Feeds base64 text into the streaming decoder up to (but not including) the
@@ -576,16 +589,12 @@ bool synthesizeSpeech(const String& text, void (*onPcmChunk)(const uint8_t* pcm,
     String body;
     serializeJson(doc, body);
 
-    String url = String(GEMINI_HOST) + GEMINI_TTS_MODEL + ":generateContent";
+    String url = geminiUrl(GEMINI_TTS_MODEL);
 
     for (int attempt = 0; attempt < 2; attempt++) {
         WiFiClientSecure client;
-        client.setInsecure();
-
         HTTPClient https;
-        if (!https.begin(client, url)) return false;
-        https.addHeader("Content-Type", "application/json");
-        https.addHeader("x-goog-api-key", GEMINI_API_KEY);
+        if (!beginGeminiRequest(client, https, url)) return false;
 
         int code = https.POST((uint8_t*)body.c_str(), body.length());
         if (code == 200) {
@@ -595,12 +604,7 @@ bool synthesizeSpeech(const String& text, void (*onPcmChunk)(const uint8_t* pcm,
         }
         https.end();
 
-        if (code == 429 && attempt == 0) {
-            delay(RETRY_DELAY_MS);
-            continue; // second and final attempt
-        }
-        Serial.printf("Gemini request failed, HTTP %d\n", code);
-        return false;
+        if (!shouldRetryGeminiRequest(code, attempt)) return false;
     }
     return false;
 }

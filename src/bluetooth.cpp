@@ -3,6 +3,7 @@
 #include "audio.h"
 #include "motor.h"
 #include <BluetoothA2DPSink.h>
+#include <esp32-hal-bt.h> // btStop()/btStart() -- see bluetoothStop()'s comment for why these (not a2dp_sink.end(true)) are what actually free/reclaim the radio
 
 static BluetoothA2DPSink a2dp_sink;
 
@@ -88,17 +89,45 @@ void bluetoothStop() {
         memcpy(lastPeerAddr, *a2dp_sink.get_current_peer_address(), sizeof(esp_bd_addr_t));
         hasLastPeer = true;
     }
-    // release_memory=true -- fully disables the Bluetooth controller
-    // (esp_bt_controller_disable(), not just the current A2DP connection).
-    // The default (false) leaves the controller enabled, which would keep
-    // contending with WiFi even while "disconnected" -- this is what
-    // actually frees the radio, which the whole point of this function is
-    // to do (see main.cpp). Confirmed by reading the library's own source
-    // (.pio/libdeps/esp32/ESP32-A2DP/src/BluetoothA2DPCommon.cpp) rather
-    // than assumed -- the full teardown this triggers costs real time (on
-    // the order of seconds, per that same source), which is why main.cpp
-    // plays a short tone right after this returns: an otherwise-silent
-    // multi-second gap reads as the device being broken, not as "listening
-    // now."
-    a2dp_sink.end(true);
+    // NOT a2dp_sink.end(true) -- a real, previously-unreported bug was found
+    // here (full-codebase review pass) by reading the library's own source
+    // (.pio/libdeps/esp32/ESP32-A2DP/src/BluetoothA2DPCommon.cpp): end(true)'s
+    // release_memory branch ends with esp_bt_controller_mem_release(), which
+    // that same source's own comment says makes a future restart of the BT
+    // controller "not possible" -- and BluetoothA2DPSink::start() enforces
+    // this immediately, via an `is_start_disabled` flag that end(true) sets
+    // and that NOTHING in the library ever resets back to false. Since this
+    // firmware calls bluetoothStop()/bluetoothStart() once per voice
+    // interaction for the device's entire lifetime (not once, ever), the old
+    // end(true) call here meant the very first button press permanently and
+    // silently killed Bluetooth speaker mode for good -- every start() call
+    // from the second interaction onward returned immediately, logging
+    // "re-start not supported after end(true)" and doing nothing else
+    // (no I2S/controller/profile re-init at all).
+    //
+    // end(false) skips that entire release_memory branch -- including the
+    // BT controller disable/deinit that's the actual point of this function
+    // (freeing the radio for WiFi, see main.cpp's enterVoiceMode()) -- so
+    // that has to happen here instead, via the Arduino core's own
+    // btStop() (esp32-hal-bt.c): it walks the controller from ENABLED down
+    // through INITED to IDLE via esp_bt_controller_disable() then
+    // esp_bt_controller_deinit(), deliberately stopping short of
+    // esp_bt_controller_mem_release() -- so, unlike end(true), it's fully
+    // reversible. The library's own bt_start() (invoked from
+    // a2dp_sink.start() on the next bluetoothStart()) is written to walk
+    // the controller status back up from IDLE through INITED to ENABLED on
+    // its own -- confirmed by reading esp32-hal-bt.c's btStart(): the same
+    // status-driven resume path it already uses to bring the controller up
+    // from cold on the very first bluetoothStart() call in setup().
+    // Bluedroid itself is deliberately left alone (never disabled) -- its
+    // status is re-checked directly (esp_bluedroid_get_status(), in
+    // BluetoothA2DPSink::init_bluetooth()) on the next start(), not assumed
+    // stale, so leaving it up here doesn't confuse that check.
+    //
+    // The full teardown this still triggers (disconnect + AVRC/A2DP
+    // profile deinit + controller disable/deinit) costs real time (on the
+    // order of seconds) just like the old end(true) call did, which is why
+    // main.cpp still plays a short tone right after this returns.
+    a2dp_sink.end(false);
+    btStop();
 }

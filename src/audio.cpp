@@ -112,8 +112,32 @@ size_t audioReadChunk(uint8_t* buf, size_t chunkBytes) {
         if (samplesRead == 0) break; // avoid spinning forever on an I2S error
 
         // Downconvert each raw 32-bit mic sample to a 16-bit PCM sample.
+        //
+        // Full-codebase review note: MIC_GAIN_SHIFT=14 is intentionally more
+        // gain than the "exact" 24-bit-to-16-bit mapping (shift=16) would
+        // give, per this file's own comment above -- fine on its own, but a
+        // bare (int16_t) cast on an out-of-range value doesn't clip, it
+        // wraps (two's-complement truncation): a raw sample whose shifted
+        // magnitude exceeds 32767 flips sign/wraps to an unrelated small
+        // value instead of saturating at the top of the range. E.g. a
+        // full-scale 24-bit mic sample (8,388,607) with this shift produces
+        // 131071, which truncates to int16 as -1, not +32767. That's a much
+        // harsher artifact (sudden polarity flips / aliasing) than the
+        // "clipping/distorted" sound the comment above leads you to expect
+        // when tuning MIC_GAIN_SHIFT during Phase 1 bring-up, and the
+        // threshold for it is far lower than "too loud" (~25% of full 24-bit
+        // scale at this shift value) -- ordinary speech volume, not just
+        // shouting. Saturating instead of wrapping doesn't fix the gain
+        // itself (still tune MIC_GAIN_SHIFT by ear as documented above), it
+        // just makes overshooting it sound/behave like the graceful
+        // clipping the comment already promises, instead of a much more
+        // confusing artifact that could easily be mistaken for a wiring
+        // problem during bring-up.
         for (size_t i = 0; i < samplesRead; i++) {
-            out[samplesFilled + i] = (int16_t)(rawBuf[i] >> MIC_GAIN_SHIFT);
+            int32_t shifted = rawBuf[i] >> MIC_GAIN_SHIFT;
+            if (shifted > INT16_MAX) shifted = INT16_MAX;
+            else if (shifted < INT16_MIN) shifted = INT16_MIN;
+            out[samplesFilled + i] = (int16_t)shifted;
         }
         samplesFilled += samplesRead;
     }
