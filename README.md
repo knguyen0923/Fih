@@ -218,18 +218,18 @@ to match your actual wiring; nothing else in `src/` hardcodes pin numbers.
 
 | Signal | Pin | Peripheral |
 |---|---|---|
-| Mic BCLK (SCK) | GPIO26 | I2S0 RX |
-| Mic WS (LRCLK) | GPIO25 | I2S0 RX |
-| Mic DATA (SD) | GPIO33 | I2S0 RX |
-| Amp BCLK | GPIO27 | I2S1 TX — **both** amp boards |
-| Amp LRC (WS) | GPIO14 | I2S1 TX — **both** amp boards |
-| Amp DIN | GPIO13 | I2S1 TX — **both** amp boards |
-| Button | GPIO4 | active-low, internal pull-up |
+| Mic BCLK (SCK) | GPIO19 | I2S0 RX |
+| Mic WS (LRCLK) | GPIO21 | I2S0 RX |
+| Mic DATA (SD) | GPIO22 | I2S0 RX |
+| Amp BCLK | GPIO4 | I2S1 TX — **both** amp boards |
+| Amp LRC (WS) | GPIO18 | I2S1 TX — **both** amp boards |
+| Amp DIN | GPIO16 | I2S1 TX — **both** amp boards |
+| Button | GPIO17 | active-low, internal pull-up |
 | Status LED | GPIO2 | — |
-| Motor A speed (PWM) | GPIO16 | H-bridge IN1 |
-| Motor A direction | GPIO17 | H-bridge IN2 — held LOW (forward-only, no reverse needed) |
-| Motor B speed (PWM) | GPIO18 | H-bridge IN1 |
-| Motor B direction | GPIO19 | H-bridge IN2 — held LOW |
+| Motor A speed (PWM) | GPIO25 | H-bridge IN1 |
+| Motor A direction | GPIO26 | H-bridge IN2 — held LOW (forward-only, no reverse needed) |
+| Motor B speed (PWM) | GPIO27 | H-bridge IN1 |
+| Motor B direction | GPIO32 | H-bridge IN2 — held LOW |
 
 Two independent I2S peripherals are used (I2S0 for the mic, I2S1 for the amp)
 rather than time-sharing one bus — this design never records and plays back

@@ -61,10 +61,10 @@
 // user's separate 5V supply) — NOT the ESP32's own 3.3V/5V rail, which isn't
 // meant to source motor current. Tie all grounds (5V supply, H-bridge,
 // ESP32) together.
-#define PIN_MOTOR_A_IN1 16
-#define PIN_MOTOR_A_IN2 17
-#define PIN_MOTOR_B_IN1 18
-#define PIN_MOTOR_B_IN2 19
+#define PIN_MOTOR_A_IN1 25
+#define PIN_MOTOR_A_IN2 26
+#define PIN_MOTOR_B_IN1 27
+#define PIN_MOTOR_B_IN2 32
 
 // --- Button and status LED ---
 // The button is wired active-low: one leg to this GPIO, the other to GND.
