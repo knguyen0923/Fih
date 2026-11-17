@@ -61,6 +61,28 @@ pio test -e esp32_test
 
 The suite has 22 tests in `test/test_device/test_main.cpp`. It uses real WiFi and real Gemini API quota. Tap near the mic and listen for the beep while it runs.
 
+#### How to run it
+
+1. Wire the board to the pins in the table above, including the motor driver with its own 5V supply.
+2. Make sure `include/config.h` has your WiFi SSID, WiFi password and Gemini API key.
+3. Plug the ESP32 into your computer over USB.
+4. Run `pio test -e esp32_test`. It builds the tests, flashes the board, runs them and prints the results over serial. If `pio` isn't on your PATH, use the VS Code PlatformIO sidebar instead: **Project Tasks → esp32_test → Advanced → Test**.
+5. Leave the board plugged in until it finishes. It takes a couple of minutes.
+
+If PlatformIO picks the wrong serial port or can't find the board, name the port:
+
+```
+pio test -e esp32_test --upload-port COM3
+```
+
+Use your own port: `COM3` or similar on Windows, `/dev/cu.usbserial-XXXX` on a Mac. If the upload won't start, hold the board's BOOT button while it connects.
+
+#### Reading the results
+
+Each test prints `[PASSED]` or `[FAILED]`. A failure includes a message saying what to check, such as the mic wiring or the SSID and password. Run the Bluetooth restart test early, since it checks the one unresolved risk from the code review.
+
+To run only some tests, comment out the other `RUN_TEST(...)` lines in `setup()` in `test/test_device/test_main.cpp`. A `-f` filter doesn't help, because the whole suite is one file.
+
 | Area | What it checks | What a failure suggests |
 |---|---|---|
 | Memory | The recording buffer fits in the heap | Lower `MAX_RECORDING_SECONDS` |
