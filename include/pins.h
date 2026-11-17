@@ -28,9 +28,9 @@
 //   BCLK (bit clock)   — toggles once per audio bit, keeps sender/receiver in sync
 //   WS   (word select)  — toggles once per audio sample, marks left/right channel
 //   DATA                — the actual audio sample bits, one wire per direction
-#define PIN_MIC_BCLK 26
-#define PIN_MIC_WS   25
-#define PIN_MIC_DATA 33
+#define PIN_MIC_BCLK 19
+#define PIN_MIC_WS   21
+#define PIN_MIC_DATA 22 //LR was used
 
 // --- I2S1 (TX) — amplifier output ---
 // A second, independent I2S peripheral drives the speaker. Using two separate
@@ -45,9 +45,9 @@
 // to be strapped per its own datasheet/silkscreen to pick left vs right —
 // this varies enough between clones/revisions that it's called out here as
 // a spot-check rather than a specific voltage/resistor value.
-#define PIN_AMP_BCLK 27
-#define PIN_AMP_WS   14
-#define PIN_AMP_DATA 13
+#define PIN_AMP_BCLK 4
+#define PIN_AMP_WS   18 //we used LRC slot since we couldnt find ws
+#define PIN_AMP_DATA 16
 
 // --- Volume-reactive DC motors (dual H-bridge, e.g. Aideepen/L298N-style) ---
 // Each motor gets 2 GPIOs (its H-bridge's two control inputs). Speed control
@@ -70,7 +70,7 @@
 // The button is wired active-low: one leg to this GPIO, the other to GND.
 // INPUT_PULLUP (set in main.cpp) means the pin reads HIGH when not pressed and
 // LOW when pressed, without needing an external resistor.
-#define PIN_BUTTON 4
+#define PIN_BUTTON 17
 // GPIO2 is technically a strapping pin, but only during the boot moment itself;
 // using it as a plain output afterward (as we do here) is standard practice —
 // many ESP32 dev boards even have an onboard LED wired to this exact pin.
