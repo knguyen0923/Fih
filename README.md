@@ -325,7 +325,9 @@ by build). This project has no use for OTA updates anyway, so `huge_app.csv`
 trades that away for a single ~3MB app partition instead.
 
 This firmware has been build-verified with `pio run` (compiles cleanly against
-`framework-arduinoespressif32 @ 3.20017`, currently RAM 18.5%/Flash 54.6% of
+`framework-arduinoespressif32 @ 3.20017` — Arduino core 2.0.17, pinned via
+`platform = espressif32@6.9.0`, since unpinned installs pull core 3.x, which
+removed the LEDC calls and moved the WiFi headers this code uses — currently RAM 18.5%/Flash 54.6% of
 the huge_app partition, reported at the end of the build) but **not**
 hardware-tested — no ESP32 was available in the environment this was built
 in. The steps below walk through validating it on real hardware in stages.
@@ -341,6 +343,7 @@ machine, no ESP32 required:
 - **`base64_core`** — the base64 encode/decode algorithm
 - **`volume_core`** — the RMS loudness calculation driving the motors
 - **`wav`** — the 44-byte WAV header builder
+- **`pins.h`** — no GPIO assigned to two signals, and all pins valid for the ESP32
 
 Run them with:
 
@@ -355,7 +358,7 @@ time, uneven 7-byte chunks, and a ~470KB buffer split into TLS-read-sized
 ~512-byte pieces — the same shapes `synthesizeSpeech()` actually feeds it in
 `gemini.cpp`), the volume calculation against known cases (silence, full-scale,
 half-scale, empty input), and every field in the WAV header at its exact byte
-offset. All 20 cases pass as of the last run.
+offset. All 26 cases pass as of the last run.
 
 `platformio.ini`'s `[env:native]` environment only compiles `base64_core.cpp`,
 `volume_core.cpp`, and `wav.cpp` for this — `audio.cpp`, `bluetooth.cpp`,
@@ -365,6 +368,14 @@ test build (see the `build_src_filter` comment there). Plain `pio run` /
 `pio run -t upload` still only ever targets the real `esp32` environment —
 `default_envs = esp32` keeps the native/test environment from being
 accidentally built or flashed.
+
+### On-device tests
+
+A second suite, `pio test -e esp32_test`, runs 22 tests on the ESP32 itself:
+motor PWM, mic capture, speaker output, Bluetooth stop/restart cycling, WiFi,
+and the three Gemini calls. It needs the board attached and wired, a filled-in
+`config.h`, and uses real API quota. See [TESTING.md](TESTING.md) for what each
+test checks and the manual checks that remain.
 
 ## Build phases (hardware bring-up)
 

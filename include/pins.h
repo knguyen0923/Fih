@@ -9,7 +9,7 @@
 // only file you should need to edit — src/audio.cpp, src/main.cpp, etc. all
 // refer to these #defines rather than hardcoding pin numbers themselves.
 //
-// Default wiring assumes a generic ESP32 WROOM-32D dev board with:
+// The pin numbers below are this project's actual wiring. The board assumed is a generic ESP32 WROOM-32D dev board with:
 //   - an INMP441 (or similar) I2S MEMS microphone
 //   - two MAX98357A (or similar) I2S amplifiers, wired for stereo output
 //   - a dual H-bridge DC motor driver + 2 DC motors, reacting to volume
@@ -30,7 +30,7 @@
 //   DATA                — the actual audio sample bits, one wire per direction
 #define PIN_MIC_BCLK 19
 #define PIN_MIC_WS   21
-#define PIN_MIC_DATA 22 //LR was used
+#define PIN_MIC_DATA 22
 
 // --- I2S1 (TX) — amplifier output ---
 // A second, independent I2S peripheral drives the speaker. Using two separate
@@ -46,7 +46,7 @@
 // this varies enough between clones/revisions that it's called out here as
 // a spot-check rather than a specific voltage/resistor value.
 #define PIN_AMP_BCLK 4
-#define PIN_AMP_WS   18 //we used LRC slot since we couldnt find ws
+#define PIN_AMP_WS   18 // the amp board's LRC pin (word select)
 #define PIN_AMP_DATA 16
 
 // --- Volume-reactive DC motors (dual H-bridge, e.g. Aideepen/L298N-style) ---
