@@ -23,6 +23,15 @@ Power the H-bridge motor supply separately, not from the ESP32's rail.
 2. Copy `include/config.h.example` to `include/config.h` and fill in your WiFi SSID, WiFi password and a [Gemini API key](https://aistudio.google.com/apikey). The file is gitignored.
 3. `platformio.ini` pins `espressif32@6.9.0` (Arduino core 2.0.17). Unpinned, installs pull core 3.x, which breaks the build (`'WiFiClient' was not declared`, `ledcSetup` removed). If you see those errors, delete `.pio` and rebuild.
 
+## Flashing the firmware (no tests)
+
+```
+pio run -t upload
+pio device monitor
+```
+
+The first uploads the real firmware (the default `esp32` environment); the second shows serial output at 115200 baud. In VS Code: **Project Tasks → esp32 → General → Upload**, then **Monitor**. Port and BOOT-button tips are under the on-device tests below. `pio test -e esp32_test` flashes the test firmware instead, so run the upload again afterward to restore the real one.
+
 ## Native tests (no board)
 
 ```
