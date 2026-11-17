@@ -18,6 +18,7 @@
 #include "base64_core.h"
 #include "wav.h"
 #include "volume_core.h"
+#include "test_pins.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -425,6 +426,8 @@ void test_wav_wrap_output_buffer_too_small(void) {
 
 int main(int argc, char** argv) {
     UNITY_BEGIN();
+    RUN_TEST(test_no_gpio_assigned_twice);
+    RUN_TEST(test_pins_are_valid_esp32_gpios);
 
     RUN_TEST(test_base64_encode_empty);
     RUN_TEST(test_base64_encode_known_vectors);
