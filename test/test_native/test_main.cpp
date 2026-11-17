@@ -19,6 +19,8 @@
 #include "wav.h"
 #include "volume_core.h"
 #include "test_pins.h"
+#include "json_scan_core.h"
+#include "pcm_align_core.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -424,8 +426,128 @@ void test_wav_wrap_output_buffer_too_small(void) {
     TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)total);
 }
 
+// ----------------------------------------------------------------------------
+// json_scan_core
+// ----------------------------------------------------------------------------
+
+static bool findAt(const char* json, const char* key, size_t* at) {
+    return jsonFindStringValueStart(json, strlen(json), key, at);
+}
+
+void test_json_scan_compact(void) {
+    const char* j = "{\"inlineData\":{\"mimeType\":\"audio/L16\",\"data\":\"QUJD\"}}";
+    size_t at = 0;
+    TEST_ASSERT_TRUE(findAt(j, "data", &at));
+    TEST_ASSERT_EQUAL_STRING("QUJD\"}}", j + at);
+}
+
+void test_json_scan_pretty_printed_like_gemini(void) {
+    const char* j = "{\n  \"inlineData\": {\n    \"mimeType\": \"audio/L16;rate=24000\",\n    \"data\": \"QUJD\"\n  }\n}";
+    size_t at = 0;
+    TEST_ASSERT_TRUE(findAt(j, "data", &at));
+    TEST_ASSERT_EQUAL_STRING("QUJD\"\n  }\n}", j + at);
+    TEST_ASSERT_TRUE(findAt(j, "mimeType", &at));
+    TEST_ASSERT_EQUAL_STRING_LEN("audio/L16;rate=24000", j + at, 20);
+}
+
+void test_json_scan_whitespace_before_colon_and_newline_after(void) {
+    const char* j = "{\"data\"  :\r\n\t \"XYZ\"}";
+    size_t at = 0;
+    TEST_ASSERT_TRUE(findAt(j, "data", &at));
+    TEST_ASSERT_EQUAL_STRING("XYZ\"}", j + at);
+}
+
+void test_json_scan_missing_key_and_incomplete_input(void) {
+    size_t at = 0;
+    TEST_ASSERT_FALSE(findAt("{\"other\": \"x\"}", "data", &at));
+    TEST_ASSERT_FALSE(findAt("", "data", &at));
+    // Key present but the head was cut off before the value's opening quote
+    // arrived -- caller reads more and retries.
+    TEST_ASSERT_FALSE(findAt("{\"data\":   ", "data", &at));
+    TEST_ASSERT_FALSE(findAt("{\"data\"", "data", &at));
+}
+
+void test_json_scan_ignores_non_string_value_and_key_prefix(void) {
+    size_t at = 0;
+    TEST_ASSERT_FALSE(findAt("{\"data\": 12}", "data", &at));
+    TEST_ASSERT_FALSE(findAt("{\"database\": \"x\"}", "data", &at));
+    // A later real match is still found past a non-matching earlier one.
+    const char* j = "{\"data\": 1, \"data\": \"ok\"}";
+    TEST_ASSERT_TRUE(findAt(j, "data", &at));
+    TEST_ASSERT_EQUAL_STRING("ok\"}", j + at);
+}
+
+// ----------------------------------------------------------------------------
+// pcm_align_core
+// ----------------------------------------------------------------------------
+
+void test_pcm_align_even_chunk_passes_through(void) {
+    PcmAligner a; pcmAlignerInit(&a);
+    const uint8_t in[4] = {1, 2, 3, 4};
+    uint8_t out[5];
+    TEST_ASSERT_EQUAL(4, pcmAlignPush(&a, in, 4, out));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(in, out, 4);
+    TEST_ASSERT_FALSE(a.hasCarry);
+}
+
+void test_pcm_align_odd_chunk_carries_last_byte(void) {
+    PcmAligner a; pcmAlignerInit(&a);
+    const uint8_t first[3] = {1, 2, 3};
+    const uint8_t second[3] = {4, 5, 6};
+    uint8_t out[4];
+    TEST_ASSERT_EQUAL(2, pcmAlignPush(&a, first, 3, out));
+    TEST_ASSERT_EQUAL_UINT8(1, out[0]);
+    TEST_ASSERT_EQUAL_UINT8(2, out[1]);
+    TEST_ASSERT_TRUE(a.hasCarry);
+    // The carried byte 3 leads the next chunk, so samples stay (3,4),(5,6).
+    TEST_ASSERT_EQUAL(4, pcmAlignPush(&a, second, 3, out));
+    const uint8_t expect[4] = {3, 4, 5, 6};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expect, out, 4);
+    TEST_ASSERT_FALSE(a.hasCarry);
+}
+
+void test_pcm_align_stream_split_arbitrarily_matches_original(void) {
+    uint8_t src[1000];
+    for (int i = 0; i < 1000; i++) src[i] = (uint8_t)(i * 7);
+    PcmAligner a; pcmAlignerInit(&a);
+    uint8_t got[1001];
+    size_t total = 0, pos = 0;
+    const size_t sizes[] = {1, 3, 7, 2, 5, 99, 1, 13};
+    for (int k = 0; pos < 1000; k++) {
+        size_t n = sizes[k % 8];
+        if (pos + n > 1000) n = 1000 - pos;
+        uint8_t out[100 + 1];
+        size_t w = pcmAlignPush(&a, src + pos, n, out);
+        TEST_ASSERT_EQUAL_MESSAGE(0, w % 2, "emitted an odd-length chunk");
+        memcpy(got + total, out, w);
+        total += w;
+        pos += n;
+    }
+    TEST_ASSERT_EQUAL(1000, total);  // 1000 is even, so nothing left over
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(src, got, 1000);
+}
+
+void test_pcm_align_single_byte_then_empty(void) {
+    PcmAligner a; pcmAlignerInit(&a);
+    const uint8_t one[1] = {9};
+    uint8_t out[2];
+    TEST_ASSERT_EQUAL(0, pcmAlignPush(&a, one, 1, out));
+    TEST_ASSERT_TRUE(a.hasCarry);
+    TEST_ASSERT_EQUAL(0, pcmAlignPush(&a, one, 0, out));  // nothing new: still holds it
+    TEST_ASSERT_TRUE(a.hasCarry);
+}
+
 int main(int argc, char** argv) {
     UNITY_BEGIN();
+    RUN_TEST(test_json_scan_compact);
+    RUN_TEST(test_json_scan_pretty_printed_like_gemini);
+    RUN_TEST(test_json_scan_whitespace_before_colon_and_newline_after);
+    RUN_TEST(test_json_scan_missing_key_and_incomplete_input);
+    RUN_TEST(test_json_scan_ignores_non_string_value_and_key_prefix);
+    RUN_TEST(test_pcm_align_even_chunk_passes_through);
+    RUN_TEST(test_pcm_align_odd_chunk_carries_last_byte);
+    RUN_TEST(test_pcm_align_stream_split_arbitrarily_matches_original);
+    RUN_TEST(test_pcm_align_single_byte_then_empty);
     RUN_TEST(test_no_gpio_assigned_twice);
     RUN_TEST(test_pins_are_valid_esp32_gpios);
 

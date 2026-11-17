@@ -1,6 +1,8 @@
 #include "gemini.h"
 #include "config.h"
 #include "base64_core.h"
+#include "json_scan_core.h"
+#include "pcm_align_core.h"
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Stream.h>
@@ -32,10 +34,11 @@ static const unsigned long RETRY_DELAY_MS = 2000;
 // larger) `data` field is located, just via a streaming scan instead of this
 // whole-string helper.
 static bool extractJsonStringField(const String& json, const char* key, String& out) {
-    String needle = String("\"") + key + "\":\"";
-    int start = json.indexOf(needle);
-    if (start < 0) return false;
-    start += needle.length();
+    // Tolerates whitespace around the colon -- Gemini pretty-prints its
+    // responses ("mimeType": "..."), so an exact `"key":"` search misses.
+    size_t startIdx;
+    if (!jsonFindStringValueStart(json.c_str(), json.length(), key, &startIdx)) return false;
+    int start = (int)startIdx;
 
     // Scan forward to the closing quote, skipping over any escaped character
     // (a backslash followed by anything) so an escaped quote inside the value
@@ -88,6 +91,13 @@ static bool beginGeminiRequest(WiFiClientSecure& client, HTTPClient& https, cons
     // parameter -- both are accepted by Gemini's API, but the header form
     // keeps the key out of any request logging that only captures URLs.
     https.addHeader("x-goog-api-key", GEMINI_API_KEY);
+    // HTTPClient's default response timeout is ~5s, too short here: TTS
+    // generateContent isn't streamed server-side, so Gemini sends nothing
+    // until the whole reply audio is generated, and audio understanding can
+    // be slow too. A timeout (HTTP -11) isn't retried by
+    // shouldRetryGeminiRequest(), so it would just fail the interaction.
+    https.setConnectTimeout(10000);
+    https.setTimeout(30000);
     return true;
 }
 
@@ -318,7 +328,8 @@ bool textOnlyQuery(const String& prompt, String& replyTextOut) {
 // handle escaping the way extractJsonStringField() does for arbitrary text.
 // Returns true if that closing quote was found in this call (i.e. the `data`
 // field is now fully consumed).
-static bool feedBase64UntilQuote(Base64DecodeStream* decodeState, const char* data, size_t len,
+static bool feedBase64UntilQuote(Base64DecodeStream* decodeState, PcmAligner* aligner,
+                                  const char* data, size_t len,
                                   void (*onPcmChunk)(const uint8_t*, size_t)) {
     size_t i = 0;
     while (i < len && data[i] != '"') i++;
@@ -326,7 +337,13 @@ static bool feedBase64UntilQuote(Base64DecodeStream* decodeState, const char* da
     if (i > 0) {
         uint8_t pcmScratch[400]; // room for base64DecodedLen() of one read's worth of input (<= 512 chars)
         size_t outLen = base64DecodeStreamUpdate(decodeState, data, i, pcmScratch, sizeof(pcmScratch));
-        if (outLen > 0) onPcmChunk(pcmScratch, outLen);
+        // Network reads split the stream at arbitrary bytes, so outLen can be
+        // odd; playback only consumes whole 16-bit samples, so carry a stray
+        // byte over to the next call instead of handing it on (see
+        // pcm_align_core.h).
+        uint8_t aligned[sizeof(pcmScratch) + 1];
+        size_t alignedLen = pcmAlignPush(aligner, pcmScratch, outLen, aligned);
+        if (alignedLen > 0) onPcmChunk(aligned, alignedLen);
     }
     return i < len;
 }
@@ -336,9 +353,9 @@ static bool feedBase64UntilQuote(Base64DecodeStream* decodeState, const char* da
 // since the call started (millis() - callStart, the same overflow-safe
 // pattern waitForWiFi() in main.cpp uses, correct even across millis()'s
 // ~49-day wraparound). Deliberately NOT enforced via WiFiClientSecure's own
-// per-character read timeout (~5s, per HTTPClient's own TCP-timeout setting
-// -- not the 30s Stream::setTimeout() default, which HTTPClient overrides;
-// see Stream::timedRead()):
+// per-character read timeout (HTTPClient applies its own TCP timeout to the
+// stream -- 30s here, set in beginGeminiRequest() -- not Stream::setTimeout()'s
+// default; see Stream::timedRead()):
 // that timeout resets on every single byte, so it can't express "give up
 // after 20s total" -- only readWithDeadline() below, by polling
 // stream.available() itself instead of trusting a blocking library read to
@@ -472,7 +489,8 @@ static size_t readDechunked(WiFiClient& stream, ChunkedReadState* state, uint8_t
 // a reply-sized buffer in. Response shape:
 //   { "candidates": [ { "content": { "parts": [ { "inlineData": {
 //       "mimeType": "...", "data": "BASE64..." } } ] } } ] }
-// Everything before "data" is small, fixed JSON metadata, so it's accumulated
+// (Gemini pretty-prints it, so expect `"data": "..."` -- whitespace after the
+// colon; see json_scan_core.h.) Everything before "data" is small, fixed JSON metadata, so it's accumulated
 // into a bounded head buffer (cheap to re-scan for the marker on every read);
 // once "data" is found, its base64 text -- the large part -- is decoded and
 // handed to onPcmChunk() a chunk at a time as it streams in.
@@ -488,9 +506,6 @@ static bool streamTtsResponse(HTTPClient& https, void (*onPcmChunk)(const uint8_
     char head[HEAD_CAP];
     size_t headLen = 0;
     int dataStart = -1;
-
-    static const char* DATA_NEEDLE = "\"data\":\"";
-    static const size_t DATA_NEEDLE_LEN = 8;
 
     uint8_t readBuf[512];
     unsigned long callStart = millis();
@@ -515,11 +530,12 @@ static bool streamTtsResponse(HTTPClient& https, void (*onPcmChunk)(const uint8_
         memcpy(head + headLen, readBuf, n);
         headLen += n;
 
-        for (size_t i = 0; i + DATA_NEEDLE_LEN <= headLen; i++) {
-            if (memcmp(head + i, DATA_NEEDLE, DATA_NEEDLE_LEN) == 0) {
-                dataStart = (int)(i + DATA_NEEDLE_LEN);
-                break;
-            }
+        // Re-scanned on every read: the key may arrive split across reads,
+        // and the opening quote may not have arrived yet (whitespace after
+        // the colon), in which case this just returns false until it does.
+        size_t valueStart;
+        if (jsonFindStringValueStart(head, headLen, "data", &valueStart)) {
+            dataStart = (int)valueStart;
         }
     }
 
@@ -539,8 +555,10 @@ static bool streamTtsResponse(HTTPClient& https, void (*onPcmChunk)(const uint8_
 
     Base64DecodeStream decodeState;
     base64DecodeStreamInit(&decodeState);
+    PcmAligner aligner;
+    pcmAlignerInit(&aligner);
 
-    if (feedBase64UntilQuote(&decodeState, head + dataStart, headLen - (size_t)dataStart, onPcmChunk)) {
+    if (feedBase64UntilQuote(&decodeState, &aligner, head + dataStart, headLen - (size_t)dataStart, onPcmChunk)) {
         return true;
     }
 
@@ -554,7 +572,7 @@ static bool streamTtsResponse(HTTPClient& https, void (*onPcmChunk)(const uint8_
             if (!stream.connected() || chunkState.ended) break;
             continue;
         }
-        if (feedBase64UntilQuote(&decodeState, (const char*)readBuf, n, onPcmChunk)) {
+        if (feedBase64UntilQuote(&decodeState, &aligner, (const char*)readBuf, n, onPcmChunk)) {
             return true;
         }
     }

@@ -57,8 +57,15 @@ static State state = IDLE;
 // be, and is the hard ceiling the RECORDING loop enforces so a stuck/taped-
 // down button can't grow memory use without limit. See MAX_RECORDING_SECONDS
 // in pins.h for why this is sized the way it is on a PSRAM-less board.
-static const size_t MAX_PCM_BYTES = (size_t)MAX_RECORDING_SECONDS * SAMPLE_RATE_CAPTURE * sizeof(int16_t);
-static const size_t MAX_WAV_BYTES = MAX_PCM_BYTES + WAV_HEADER_SIZE;
+//
+// This is the *desired* size. malloc() needs one contiguous block, and on a
+// classic ESP32 the largest free block is typically only ~110KB even with
+// ~300KB free in total -- smaller than the default 5s cap's ~160KB -- so
+// setup() shrinks maxPcmBytes to whatever actually fits (see there) rather
+// than halting at boot.
+static const size_t DESIRED_PCM_BYTES = (size_t)MAX_RECORDING_SECONDS * SAMPLE_RATE_CAPTURE * sizeof(int16_t);
+static const size_t MIN_PCM_BYTES = (size_t)SAMPLE_RATE_CAPTURE * sizeof(int16_t); // 1s -- below this, recording is pointless
+static size_t maxPcmBytes = DESIRED_PCM_BYTES; // actual recording cap; set in setup() once wavBuf is allocated
 
 // The one large buffer this firmware still holds in full: the raw recording,
 // captured before understandSpeech() can be called at all (its final length
@@ -106,6 +113,21 @@ static bool readButtonPressed() {
         buttonStable = raw;
     }
     return buttonStable;
+}
+
+// Blocks until the button is physically released, then resets the debounce
+// state. Called after an interaction finishes: the recording loop can end
+// because the buffer filled while the button is still held, and without this
+// loop() would see the button still down and immediately start another
+// recording and Gemini round trip -- forever, if it's held or stuck. It also
+// clears the stale "pressed" reading left from before the (long, blocking)
+// interaction, which would otherwise be reported as a fresh press for
+// DEBOUNCE_MS after release.
+static void waitForButtonRelease() {
+    while (digitalRead(PIN_BUTTON) == LOW) delay(10);
+    lastButtonRaw = false;
+    buttonStable = false;
+    lastDebounceChange = millis();
 }
 
 // --- Status LED ---
@@ -264,7 +286,6 @@ static void exitVoiceMode() {
     motorStop();
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
-    audioSetPlaybackRate(SAMPLE_RATE_BLUETOOTH);
     audioPlayTone(SAMPLE_RATE_BLUETOOTH, TONE_EXIT_VOICE_HZ, TONE_DURATION_MS);
     bluetoothStart(); // proactively reconnects to the last-paired phone, see bluetooth.cpp
 }
@@ -281,7 +302,7 @@ static void processInteraction(size_t pcmLen) {
     updateLed();
     // Wrap the raw PCM (already sitting in pcmBuf, which points into wavBuf --
     // see setup()) with a WAV header describing its format.
-    size_t wavLen = wavWrap(pcmBuf, pcmLen, wavBuf, MAX_WAV_BYTES);
+    size_t wavLen = wavWrap(pcmBuf, pcmLen, wavBuf, maxPcmBytes + WAV_HEADER_SIZE);
     if (wavLen == 0) {
         Serial.println("WAV wrap failed (buffer too small)");
         flashError();
@@ -343,7 +364,23 @@ void setup() {
     // firmware (the base64-encoded upload and the decoded TTS reply are both
     // streamed instead -- see gemini.cpp), which is what makes fitting it in
     // internal SRAM feasible at all.
-    wavBuf = (uint8_t*)malloc(MAX_WAV_BYTES);
+    // Try the desired size first; if the heap is too fragmented/small for one
+    // block that big, fall back to the largest block available (rounded down
+    // to a whole chunk, minus a little slack) rather than failing outright.
+    Serial.printf("Largest allocatable block: %u bytes\n", ESP.getMaxAllocHeap());
+    wavBuf = (uint8_t*)malloc(DESIRED_PCM_BYTES + WAV_HEADER_SIZE);
+    if (!wavBuf) {
+        size_t avail = ESP.getMaxAllocHeap();
+        size_t pcmBytes = (avail > WAV_HEADER_SIZE + 4096) ? ((avail - WAV_HEADER_SIZE - 4096) / 512) * 512 : 0;
+        if (pcmBytes >= MIN_PCM_BYTES) {
+            wavBuf = (uint8_t*)malloc(pcmBytes + WAV_HEADER_SIZE);
+            if (wavBuf) {
+                maxPcmBytes = pcmBytes;
+                Serial.printf("Recording cap reduced to %.1fs (%u bytes) to fit the heap\n",
+                              pcmBytes / (float)(SAMPLE_RATE_CAPTURE * sizeof(int16_t)), (unsigned)pcmBytes);
+            }
+        }
+    }
     if (!wavBuf) {
         // Nothing useful can happen without this buffer -- this is the one
         // truly unrecoverable failure mode, unlike API/network errors below.
@@ -440,7 +477,7 @@ void loop() {
 
     size_t recorded = 0;
     const size_t chunkBytes = 512; // ~16ms of audio per chunk at 16kHz/16-bit -- small enough for prompt release detection
-    while (readButtonPressed() && recorded + chunkBytes <= MAX_PCM_BYTES) {
+    while (readButtonPressed() && recorded + chunkBytes <= maxPcmBytes) {
         size_t got = audioReadChunk(pcmBuf + recorded, chunkBytes);
         if (got == 0) break; // I2S read error -- stop early rather than spin forever
         recorded += got;
@@ -487,4 +524,5 @@ void loop() {
     exitVoiceMode();
     state = IDLE;
 #endif
+    waitForButtonRelease();
 }

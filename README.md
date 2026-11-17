@@ -336,13 +336,15 @@ in. The steps below walk through validating it on real hardware in stages.
 
 Most of this firmware — I2S audio, WiFi, Bluetooth, motor PWM, the Gemini
 HTTPS calls — can only be meaningfully tested on real hardware (that's what
-the build phases below are for). But three pieces have no hardware
+the build phases below are for). But several pieces have no hardware
 dependency at all and get real, automated unit tests that run on your own
 machine, no ESP32 required:
 
 - **`base64_core`** — the base64 encode/decode algorithm
 - **`volume_core`** — the RMS loudness calculation driving the motors
 - **`wav`** — the 44-byte WAV header builder
+- **`json_scan_core`** — finds a JSON string field in the streaming TTS reply, tolerating Gemini's pretty-printed whitespace
+- **`pcm_align_core`** — keeps streamed PCM chunks sample-aligned (no odd byte counts reaching playback)
 - **`pins.h`** — no GPIO assigned to two signals, and all pins valid for the ESP32
 
 Run them with:
@@ -358,7 +360,7 @@ time, uneven 7-byte chunks, and a ~470KB buffer split into TLS-read-sized
 ~512-byte pieces — the same shapes `synthesizeSpeech()` actually feeds it in
 `gemini.cpp`), the volume calculation against known cases (silence, full-scale,
 half-scale, empty input), and every field in the WAV header at its exact byte
-offset. All 26 cases pass as of the last run.
+offset. All 35 cases pass as of the last run.
 
 `platformio.ini`'s `[env:native]` environment only compiles `base64_core.cpp`,
 `volume_core.cpp`, and `wav.cpp` for this — `audio.cpp`, `bluetooth.cpp`,

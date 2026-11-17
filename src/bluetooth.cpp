@@ -59,6 +59,16 @@ static void onAudioData(const uint8_t* data, uint32_t len) {
     motorUpdateFromPcm(data, len);
 }
 
+// Called by the A2DP library (on its own task) when a phone's SBC stream
+// negotiates its sample rate -- 44.1kHz is common but 48kHz (and 32/16kHz) are
+// valid too, and the library doesn't retune I2S1 for us since its own I2S
+// output is off (see bluetoothStart()). Without this, a 48kHz stream would
+// play ~8% slow and flat. (Channel count isn't handled: I2S1 is always
+// stereo, and phones send stereo.)
+static void onSampleRate(uint16_t rate) {
+    audioSetPlaybackRate(rate);
+}
+
 void bluetoothMute() {
     muted = true;
 }
@@ -73,6 +83,7 @@ void bluetoothStart() {
     // `false` -- don't let the library also drive its own I2S output;
     // audio.cpp already owns I2S1, so this just wants the raw PCM callback.
     a2dp_sink.set_stream_reader(onAudioData, false);
+    a2dp_sink.set_sample_rate_callback(onSampleRate);
     a2dp_sink.start(BT_DEVICE_NAME);
 
     if (hasLastPeer) {

@@ -38,8 +38,9 @@
 
 // Upper bound on how many tokens Gemini's reply may contain. This exists for a
 // very physical reason: a longer text reply means a longer TTS audio reply,
-// which means a bigger PCM buffer has to fit in PSRAM downstream. Keeping
-// replies short keeps memory use (and the user's wait time) bounded.
+// which means more audio to generate, stream and play. (The reply is streamed,
+// not buffered, so this isn't a memory limit -- the recording buffer is the
+// big allocation.) Keeping replies short keeps the user's wait time bounded.
 #define GEMINI_MAX_OUTPUT_TOKENS 150
 
 // ============================================================================

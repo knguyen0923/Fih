@@ -133,9 +133,9 @@ void test_mic_not_stuck_at_constant_value(void) {
 void test_play_tone_returns_in_time(void) {
     // LISTEN: you should hear a ~300ms beep from both speakers.
     unsigned long t = millis();
-    audioPlayTone(SAMPLE_RATE_PLAYBACK, 880, 300);
+    audioPlayTone(SAMPLE_RATE_PLAYBACK, 880, 300);  // sets the I2S rate itself
     unsigned long took = millis() - t;
-    TEST_ASSERT_UINT32_WITHIN(400, 300, took);
+    TEST_ASSERT_UINT32_WITHIN(150, 300, took);
 }
 
 void test_play_mono_as_stereo_returns(void) {

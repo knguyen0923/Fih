@@ -8,7 +8,7 @@
 // ============================================================================
 //
 // This module owns both audio directions:
-//   - I2S0 (RX) reads from the microphone into a caller-provided PSRAM buffer
+//   - I2S0 (RX) reads from the microphone into a caller-provided buffer (plain internal heap -- this board has no PSRAM)
 //   - I2S1 (TX) writes to the amplifier from a caller-provided PCM buffer
 //
 // The two directions never run at the same time in this design (push-to-talk
@@ -50,8 +50,9 @@ void audioSetPlaybackRate(uint32_t sampleRate);
 void audioPlayMonoAsStereo(const uint8_t* monoPcm, size_t len);
 
 // Plays a short sine-wave tone through the amp, blocking until it finishes.
-// `sampleRate` must match whatever I2S1 is currently configured for (see
-// audioSetPlaybackRate()) -- used as a brief UI cue around the Bluetooth/
+// Sets I2S1 to `sampleRate` first (see audioSetPlaybackRate()), and leaves it
+// there -- callers switching back to another rate afterward must set it
+// themselves. Used as a brief UI cue around the Bluetooth/
 // WiFi radio switch (see main.cpp), so an otherwise-silent multi-second gap
 // while Bluetooth fully tears down/reconnects reads as an intentional "the
 // assistant is listening now" (or "back to being a speaker") moment,

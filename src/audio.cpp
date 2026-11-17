@@ -191,6 +191,9 @@ void audioPlayMonoAsStereo(const uint8_t* monoPcm, size_t len) {
 }
 
 void audioPlayTone(uint32_t sampleRate, uint32_t freqHz, uint32_t durationMs) {
+    // Sets the rate itself: the samples below are generated for `sampleRate`,
+    // so they must also be clocked out at it, whatever I2S1 was last set to.
+    audioSetPlaybackRate(sampleRate);
     const size_t totalSamples = (size_t)((uint64_t)sampleRate * durationMs / 1000);
     const size_t samplesPerChunk = 128;
     int16_t stereoBuf[samplesPerChunk * 2];
