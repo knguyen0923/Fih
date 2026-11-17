@@ -1,121 +1,90 @@
 # Fih — Wiring and Test Guide
 
-Fih is an ESP32-WROOM-32D push-to-talk voice assistant that doubles as a Bluetooth speaker with two volume-reactive DC motors. This guide covers the pin map, the automated tests, and the checks that still need a person.
+ESP32-WROOM-32D push-to-talk Gemini voice assistant and Bluetooth speaker with two volume-reactive motors. This guide covers the pin map, the automated tests, and the manual checks.
 
 ## Pin map
 
-Defined in `include/pins.h`. Nothing else in `src/` hardcodes a pin number.
+Defined in `include/pins.h`.
 
 | Signal | GPIO | Notes |
 |---|---|---|
-| Mic BCLK | 19 | I2S0 RX |
-| Mic WS | 21 | I2S0 RX |
-| Mic DATA | 22 | I2S0 RX |
-| Amp BCLK | 4 | I2S1 TX, shared by both amp boards |
-| Amp WS (LRC) | 18 | I2S1 TX, shared by both amp boards |
-| Amp DIN | 16 | I2S1 TX, shared by both amp boards |
+| Mic BCLK / WS / DATA | 19 / 21 / 22 | I2S0 RX |
+| Amp BCLK / WS (LRC) / DIN | 4 / 18 / 16 | I2S1 TX, shared by both amp boards |
 | Button | 17 | Active-low, internal pull-up |
 | Status LED | 2 | |
-| Motor A IN1 | 25 | PWM speed |
-| Motor A IN2 | 26 | Held low |
-| Motor B IN1 | 27 | PWM speed |
-| Motor B IN2 | 32 | Held low |
+| Motor A IN1 / IN2 | 25 / 26 | PWM speed / held low |
+| Motor B IN1 / IN2 | 27 / 32 | PWM speed / held low |
 
-The motors need their own 5V supply for the H-bridge. Do not power them from the ESP32's rail.
+Power the H-bridge motor supply separately, not from the ESP32's rail.
 
 ## Setup
 
 1. Install [PlatformIO](https://platformio.org/).
-2. Copy `include/config.h.example` to `include/config.h` and fill in your WiFi SSID, WiFi password, and a Gemini API key (https://aistudio.google.com/apikey). `config.h` is gitignored.
-3. The platform is pinned to `espressif32@6.9.0` (Arduino core 2.0.17) in `platformio.ini`. Unpinned, a fresh install pulls Arduino core 3.x, which breaks the build (`ledcSetup` removed, WiFi headers moved). If you see errors like `'WiFiClient' was not declared`, delete the `.pio` folder and rebuild.
+2. Copy `include/config.h.example` to `include/config.h` and fill in your WiFi SSID, WiFi password and a [Gemini API key](https://aistudio.google.com/apikey). The file is gitignored.
+3. `platformio.ini` pins `espressif32@6.9.0` (Arduino core 2.0.17). Unpinned, installs pull core 3.x, which breaks the build (`'WiFiClient' was not declared`, `ledcSetup` removed). If you see those errors, delete `.pio` and rebuild.
 
-## Automated tests
-
-### 1. Native tests (no board needed)
+## Native tests (no board)
 
 ```
 pio test -e native
 ```
 
-These 35 tests cover the pure logic, the parts with no Arduino or ESP-IDF dependency:
+35 tests of the pure logic:
 
-| Module | What it checks |
+| Module | Checks |
 |---|---|
-| `base64_core` | Known vectors, round trips at recording size, the streaming decoder against arbitrary chunk splits, undersized-buffer handling |
-| `wav` | Every WAV header field at its byte offset, buffer-too-small handling |
-| `volume_core` | RMS loudness for silence, full-scale, half-scale and empty input |
-| `json_scan_core` | Finds the `data` and `mimeType` fields in Gemini's TTS reply: compact and pretty-printed JSON, whitespace around the colon, a missing key, input cut off mid-whitespace, and non-string values |
-| `pcm_align_core` | Streamed PCM chunks always come out as whole 16-bit samples: odd bytes are carried to the next chunk, and an arbitrary split reproduces the original stream exactly |
-| `pins.h` | The pin checks below |
+| `base64_core` | Known vectors, round trips, streaming decode across arbitrary splits, undersized buffers |
+| `wav` | Every header field at its byte offset, undersized buffers |
+| `volume_core` | RMS loudness for silence, full-scale, half-scale, empty input |
+| `json_scan_core` | Finds `data` and `mimeType` in Gemini's TTS reply: compact and pretty-printed JSON, whitespace around the colon, missing key, truncated input, non-string values |
+| `pcm_align_core` | Streamed PCM always comes out as whole 16-bit samples; any split reproduces the original stream |
+| `pins.h` | No GPIO assigned twice; no flash pins (6–11) or out-of-range pins |
 
-- `test_no_gpio_assigned_twice` fails if two signals share a GPIO.
-- `test_pins_are_valid_esp32_gpios` fails if a pin is a flash pin (6–11) or out of range.
+The pin tests check the file, not your physical wiring.
 
-These check `pins.h` only. They cannot tell you whether your physical wires match the file.
+## On-device tests (board wired and attached)
 
-### 2. On-device tests (board attached and wired)
+22 tests in `test/test_device/test_main.cpp`. They use real WiFi and Gemini API quota. Tap near the mic and listen for the beep while they run.
 
-```
-pio test -e esp32_test
-```
+1. Wire the board per the pin map and fill in `config.h`.
+2. Plug the ESP32 in over USB.
+3. Run:
+   ```
+   pio test -e esp32_test
+   ```
+   Or, in VS Code: **Project Tasks → esp32_test → Advanced → Test**. It takes a couple of minutes; don't unplug the board.
+4. If it picks the wrong port, add `--upload-port <port>` (`COM3` on Windows, `/dev/cu.usbserial-XXXX` on a Mac). If the upload won't start, hold the board's BOOT button while it connects.
 
-The suite has 22 tests in `test/test_device/test_main.cpp`. It uses real WiFi and real Gemini API quota. Tap near the mic and listen for the beep while it runs.
+Each test prints `[PASSED]` or `[FAILED]`, with a message saying what to check. To run only some tests, comment out the other `RUN_TEST(...)` lines in `setup()`; `-f` can't filter within one file. Run the Bluetooth restart test first.
 
-#### How to run it
-
-1. Wire the board to the pins in the table above, including the motor driver with its own 5V supply.
-2. Make sure `include/config.h` has your WiFi SSID, WiFi password and Gemini API key.
-3. Plug the ESP32 into your computer over USB.
-4. Run `pio test -e esp32_test`. It builds the tests, flashes the board, runs them and prints the results over serial. If `pio` isn't on your PATH, use the VS Code PlatformIO sidebar instead: **Project Tasks → esp32_test → Advanced → Test**.
-5. Leave the board plugged in until it finishes. It takes a couple of minutes.
-
-If PlatformIO picks the wrong serial port or can't find the board, name the port:
-
-```
-pio test -e esp32_test --upload-port COM3
-```
-
-Use your own port: `COM3` or similar on Windows, `/dev/cu.usbserial-XXXX` on a Mac. If the upload won't start, hold the board's BOOT button while it connects.
-
-#### Reading the results
-
-Each test prints `[PASSED]` or `[FAILED]`. A failure includes a message saying what to check, such as the mic wiring or the SSID and password. Run the Bluetooth restart test early, since it checks the one unresolved risk from the code review.
-
-To run only some tests, comment out the other `RUN_TEST(...)` lines in `setup()` in `test/test_device/test_main.cpp`. A `-f` filter doesn't help, because the whole suite is one file.
-
-| Area | What it checks | What a failure suggests |
+| Area | Checks | A failure suggests |
 |---|---|---|
-| Memory | The recording buffer fits in the heap | Lower `MAX_RECORDING_SECONDS` |
-| Button | Reads HIGH when untouched | Shorted, wired active-high, or the pin is shared |
-| LED | Pin toggles | LED pin wiring |
-| Motors | PWM duty is 0 at init and on silence, rises with loudness, and returns to 0 on stop. IN2 pins stay low | Motor pin or logic problem |
-| Mic | Returns samples within 2 s, and the samples vary | Mic wiring or pins |
-| Speaker | The tone takes about 300 ms (within 150 ms) at its own sample rate, and mono-to-stereo playback returns | Amp wiring, pins, or sample-rate handling |
-| WAV | A full-size recording wraps correctly | Header builder bug |
-| Bluetooth | Stop frees the controller, restart works, 3 stop/start cycles don't leak more than 8 KB of heap, mute/unmute don't crash | Radio-switching bug |
-| WiFi and Gemini | WiFi connects, text query, TTS stream (checks for truncation and odd-sized chunks), audio upload, WiFi teardown then Bluetooth resumes | Credentials, network, or API issue |
+| Memory | Recording buffer fits in the heap | Lower `MAX_RECORDING_SECONDS` |
+| Button | Reads HIGH untouched | Shorted, wired active-high, or shared pin |
+| LED | Pin toggles | LED wiring |
+| Motors | Duty is 0 at init and on silence, rises with loudness, returns to 0 on stop; IN2 stays low | Motor pin or logic |
+| Mic | Samples arrive within 2 s and vary | Mic wiring or pins |
+| Speaker | Tone lasts ~300 ms (±150) at its own sample rate; mono-to-stereo playback returns | Amp wiring, pins, sample rate |
+| WAV | Full-size recording wraps correctly | Header builder |
+| Bluetooth | Stop frees the controller, restart works, 3 cycles leak under 8 KB, mute/unmute don't crash | Radio switching |
+| WiFi and Gemini | WiFi connects; text query; TTS stream (no truncation or odd-sized chunks); audio upload; WiFi teardown then Bluetooth resumes | Credentials, network, API |
 
-The motor test reads the PWM register. It does not prove the motor spins.
+The motor test reads the PWM register; it doesn't prove the motor spins.
 
-## What needs a person
+## Manual checks
 
-Automated tests cannot cover these. Check them by hand.
-
-- [ ] **Motors spin.** Play music or a TTS reply and watch both motors react to volume. Confirm the H-bridge supply is powered.
-- [ ] **Button press.** The suite only checks the idle state. Press the button and confirm the LED and serial output react.
-- [ ] **Left/right speaker order.** Play stereo audio and confirm each speaker plays its own channel. If they are swapped, mono, or silent, fix the amp channel-select wiring.
-- [ ] **Bluetooth pairing.** Pair a phone named "Fih Speaker" and confirm stereo music plays.
-- [ ] **Music speed.** The speaker follows the sample rate the phone negotiates (44.1 or 48 kHz). If a phone's music sounds slow and low-pitched, that rate handling isn't working.
-- [ ] **Audio quality.** Listen for pitch or speed artifacts. Tune `MIC_GAIN_SHIFT` in `src/audio.cpp` if the audio is too quiet or clipping.
-- [ ] **Full flow.** Press the button, speak, release, and hear a Gemini reply. Confirm Bluetooth resumes afterward. Repeat several times.
-- [ ] **Clean reply audio.** Listen for static or garbling in the spoken reply. That would point at the streaming/alignment code.
-- [ ] **Held button.** Hold the button past the recording cap. The device should answer once and then wait for you to release, not start another recording.
-- [ ] **Recording cap.** Check the serial log at boot. If it prints "Recording cap reduced to ...", the full 5 seconds didn't fit in one block of heap and the device is using a shorter limit.
+- [ ] **Motors:** play music or a TTS reply; both motors react to volume. Check the H-bridge supply.
+- [ ] **Button:** the suite only checks idle. Press it; the LED and serial output react.
+- [ ] **Speaker channels:** each speaker plays its own channel. Swapped, mono or silent means fix the amp channel-select wiring.
+- [ ] **Bluetooth:** pair "Fih Speaker"; stereo music plays at normal speed (slow and low-pitched means the negotiated 44.1/48 kHz rate isn't followed).
+- [ ] **Audio quality:** no pitch or speed artifacts; tune `MIC_GAIN_SHIFT` in `src/audio.cpp` if too quiet or clipping.
+- [ ] **Full flow:** press, speak, release, hear a clean Gemini reply (static or garbling points at the streaming code), and Bluetooth resumes. Repeat several times.
+- [ ] **Held button:** hold past the recording cap; the device answers once, then waits for release.
+- [ ] **Recording cap:** if the boot log prints "Recording cap reduced to ...", the full 5 seconds didn't fit in one heap block.
 
 ## Notes
 
-- The on-device suite compiles cleanly but has not yet been run on real hardware, so expect to adjust a few tests the first time.
-- The native tests cover the parsing and alignment logic, but nothing exercises the real Gemini reply end to end except the on-device `test_gemini_tts_streams_pcm`, so run that early.
-- Open risk: whether `bluetoothStop()` leaves Bluetooth restartable on real hardware is unverified. The on-device Bluetooth restart test is the check, so run it first.
-- WiFi and Bluetooth Classic share one radio on the ESP32. The firmware fully stops Bluetooth for each Gemini round-trip and restarts it afterward.
-- See `README.md` for the full architecture, API shapes, and troubleshooting table.
+- The on-device suite compiles but has never run on hardware; expect to adjust a few tests.
+- `test_gemini_tts_streams_pcm` is the only end-to-end check of the real Gemini reply; run it early.
+- Open risk: whether `bluetoothStop()` leaves Bluetooth restartable on real hardware is unverified. The Bluetooth restart test is the check.
+- See `README.md` for architecture, API shapes and troubleshooting.
